@@ -57,9 +57,7 @@ class GLM5Bridge(MegatronModelBridge):
             "ffn_hidden_size": hf_config.intermediate_size,
             "num_attention_heads": hf_config.num_attention_heads,
             "num_query_groups": hf_config.num_key_value_heads,
-            # GLM5/Slime MLA uses kv_channels == qk_nope_head_dim (192 for GLM-5),
-            # not HF's attribute-mapped `head_dim` alias which resolves to qk_rope_head_dim.
-            "kv_channels": hf_config.qk_nope_head_dim,
+            "kv_channels": hf_config.head_dim,
             "seq_length": hf_config.max_position_embeddings,
             "q_lora_rank": hf_config.q_lora_rank,
             "kv_lora_rank": hf_config.kv_lora_rank,
