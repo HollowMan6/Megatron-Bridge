@@ -80,7 +80,7 @@ class GLM5Bridge(MegatronModelBridge):
             "rotary_base": hf_config.rope_parameters["rope_theta"],
             "init_method_std": hf_config.initializer_range,
             "layernorm_epsilon": hf_config.rms_norm_eps,
-            "dsa_indexer_k_norm_epsilon": 1e-6,
+            # "dsa_indexer_k_norm_epsilon": 1e-6,
             "attention_dropout": hf_config.attention_dropout,
             "multi_latent_attention": True,
             # DSA indexer params (v3.2-compatible interface)
@@ -90,9 +90,9 @@ class GLM5Bridge(MegatronModelBridge):
             "dsa_indexer_topk": hf_config.index_topk,
             "dsa_indexer_loss_coeff": 0.0,
             "dsa_indexer_use_sparse_loss": False,
-            "dsa_indexer_rope_interleaved": True,
-            "dsa_indexer_rotate_activation": False,
-            "dsa_indexer_scoring_relu": True,
+            # "dsa_indexer_rope_interleaved": True,
+            # "dsa_indexer_rotate_activation": False,
+            # "dsa_indexer_scoring_relu": True,
             # MTP params
             "mtp_num_layers": getattr(hf_config, "num_nextn_predict_layers", 0),
             "mtp_loss_scaling_factor": 0.1,
@@ -136,10 +136,10 @@ class GLM5Bridge(MegatronModelBridge):
         provider.share_embeddings_and_output_weights = False
         provider.qk_layernorm = True
         provider.multi_latent_attention = True
-        provider.dsa_indexer_rope_interleaved = True
-        provider.dsa_indexer_rotate_activation = False
-        provider.dsa_indexer_scoring_relu = True
-        provider.dsa_indexer_k_norm_epsilon = 1e-6
+        # provider.dsa_indexer_rope_interleaved = True
+        # provider.dsa_indexer_rotate_activation = False
+        # provider.dsa_indexer_scoring_relu = True
+        # provider.dsa_indexer_k_norm_epsilon = 1e-6
         provider.dsa_indexer_loss_coeff = 0.0
         provider.dsa_indexer_use_sparse_loss = False
         provider.moe_grouped_gemm = True
