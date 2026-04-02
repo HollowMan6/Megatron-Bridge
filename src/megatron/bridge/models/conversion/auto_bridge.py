@@ -478,7 +478,7 @@ class AutoBridge(Generic[MegatronModelT]):
 
         adapter_state: dict[str, torch.Tensor] = {}
         for name, tensor in self.export_adapter_weights(model, cpu=True, show_progress=show_progress):
-            adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
+            adapter_state[f"base_model.model.{name}"] = tensor.clone()
 
         if not adapter_state:
             raise RuntimeError(
