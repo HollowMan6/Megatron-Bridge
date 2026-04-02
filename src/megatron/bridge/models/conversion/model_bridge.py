@@ -151,20 +151,29 @@ def _megatron_local_name_to_global(
         num_experts = config.num_moe_experts
         num_experts_per_rank = num_experts // ep_group.size()
 
-        def _update_expert_number(param_name: str, param_type: str) -> str:
-            """Update expert number from local to global for weight or bias parameters."""
-            local_expert_number = int(param_name.split(f".{param_type}")[-1])
+        if ".mlp.experts.local_experts." in param_name:
+            local_expert_number = int(param_name.split(".mlp.experts.local_experts.")[1].split(".")[0])
             global_expert_number = num_experts_per_rank * ep_group.rank() + local_expert_number
-            return param_name.replace(
-                f".{param_type}{local_expert_number}",
-                f".{param_type}{global_expert_number}",
+            param_name = param_name.replace(
+                f".local_experts.{local_expert_number}.",
+                f".local_experts.{global_expert_number}.",
+                1,
             )
+        elif ".mlp.experts.linear_fc" in param_name:
+            def _update_expert_number(param_name: str, param_type: str) -> str:
+                """Update expert number from local to global for weight or bias parameters."""
+                local_expert_number = int(param_name.split(f".{param_type}")[-1])
+                global_expert_number = num_experts_per_rank * ep_group.rank() + local_expert_number
+                return param_name.replace(
+                    f".{param_type}{local_expert_number}",
+                    f".{param_type}{global_expert_number}",
+                )
 
-        # Handle weight and bias parameters
-        if ".weight" in param_name:
-            param_name = _update_expert_number(param_name, "weight")
-        elif ".bias" in param_name:
-            param_name = _update_expert_number(param_name, "bias")
+            # Handle weight and bias parameters
+            if ".weight" in param_name:
+                param_name = _update_expert_number(param_name, "weight")
+            elif ".bias" in param_name:
+                param_name = _update_expert_number(param_name, "bias")
     return param_name
 
 

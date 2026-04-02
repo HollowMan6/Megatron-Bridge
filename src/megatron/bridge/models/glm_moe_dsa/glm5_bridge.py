@@ -142,7 +142,7 @@ class GLM5Bridge(MegatronModelBridge):
         # provider.dsa_indexer_k_norm_epsilon = 1e-6
         provider.dsa_indexer_loss_coeff = 0.0
         provider.dsa_indexer_use_sparse_loss = False
-        provider.moe_grouped_gemm = True
+        provider.moe_grouped_gemm = False
         provider.moe_router_pre_softmax = True
         provider.moe_router_enable_expert_bias = True
         provider.moe_router_bias_update_rate = 0.0
@@ -182,6 +182,7 @@ class GLM5Bridge(MegatronModelBridge):
             # MoE
             "decoder.layers.*.mlp.router.weight": "model.layers.*.mlp.gate.weight",
             "decoder.layers.*.mlp.experts.linear_fc2.weight*": "model.layers.*.mlp.experts.*.down_proj.weight",
+            "decoder.layers.*.mlp.experts.local_experts.*.linear_fc2.weight": "model.layers.*.mlp.experts.*.down_proj.weight",
             "decoder.layers.*.mlp.shared_experts.linear_fc2.weight": "model.layers.*.mlp.shared_experts.down_proj.weight",
             # LM Head
             "decoder.final_layernorm.weight": "model.norm.weight",
@@ -245,6 +246,11 @@ class GLM5Bridge(MegatronModelBridge):
                     gate="model.layers.*.mlp.experts.*.gate_proj.weight",
                     up="model.layers.*.mlp.experts.*.up_proj.weight",
                 ),
+                GatedMLPMapping(
+                    megatron_param="decoder.layers.*.mlp.experts.local_experts.*.linear_fc1.weight",
+                    gate="model.layers.*.mlp.experts.*.gate_proj.weight",
+                    up="model.layers.*.mlp.experts.*.up_proj.weight",
+                ),
             ]
         )
         hf_config = self.hf_config
@@ -276,9 +282,9 @@ class GLM5Bridge(MegatronModelBridge):
             for layer_prefix in ("transformer_layer", "mtp_model_layer"):
                 for megatron_param, hf_param in (param_mappings | layer_specific_mappings).items():
                     megatron_param = (
-                        megatron_param.replace(".*", f".*.{layer_prefix}")
+                        megatron_param.replace(".*", f".*.{layer_prefix}", 1)
                         .replace("decoder", "mtp")
-                        .replace(".*", f".{mtp_layer}")
+                        .replace(".*", f".{mtp_layer}", 1)
                     )
                     hf_param = hf_param.replace("layers.*", f"layers.{mtp_layer + num_transformer_layers}")
                     mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
@@ -309,6 +315,11 @@ class GLM5Bridge(MegatronModelBridge):
                         ),
                         GatedMLPMapping(
                             megatron_param=f"mtp.layers.{mtp_layer}.{layer_prefix}.mlp.experts.linear_fc1.weight*",
+                            gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.gate_proj.weight",
+                            up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.up_proj.weight",
+                        ),
+                        GatedMLPMapping(
+                            megatron_param=f"mtp.layers.{mtp_layer}.{layer_prefix}.mlp.experts.local_experts.*.linear_fc1.weight",
                             gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.gate_proj.weight",
                             up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.up_proj.weight",
                         ),
