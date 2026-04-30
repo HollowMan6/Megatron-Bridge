@@ -1161,6 +1161,7 @@ class AutoMapping(MegatronParamMapping[torch.Tensor]):
             "LinearCrossEntropyModule",
             "TEColumnParallelLinear",
             "TELayerNormColumnParallelLinear",
+            "InferenceLayerNormColumnParallelLinear",
             "TEColumnParallelGroupedLinear",
             "VocabParallelEmbedding",
             "DotProductAttention",  # for attention sink only
@@ -1169,6 +1170,7 @@ class AutoMapping(MegatronParamMapping[torch.Tensor]):
         "row": {
             "RowParallelLinear",
             "TERowParallelLinear",
+            "InferenceRowParallelLinear",
             "TERowParallelGroupedLinear",
         },
         "replicated": {
@@ -1180,6 +1182,7 @@ class AutoMapping(MegatronParamMapping[torch.Tensor]):
             "RMSNorm",
             "L2Norm",
             # Other non-parallel modules
+            "InferenceTopKRouter",
             "IdentityOp",
             "TopKRouter",
         },
@@ -1240,7 +1243,7 @@ class AutoMapping(MegatronParamMapping[torch.Tensor]):
         # Handle fused modules like TELayerNormColumnParallelLinear
         # These modules have both column-parallel weights (weight, bias)
         # and replicated layer norm weights (layer_norm_weight, layer_norm_bias)
-        if module_type == "TELayerNormColumnParallelLinear":
+        if module_type in ("TELayerNormColumnParallelLinear", "InferenceLayerNormColumnParallelLinear"):
             # Check the actual parameter name to determine the correct parallelism type
             if self.megatron_param and (
                 self.megatron_param.endswith("layer_norm_weight") or self.megatron_param.endswith("layer_norm_bias")
