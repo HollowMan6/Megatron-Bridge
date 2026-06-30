@@ -105,6 +105,7 @@ class GLM5Bridge(MegatronModelBridge):
         provider.rotary_scaling_factor = 1.0
         provider.mscale = 1.0
         provider.mscale_all_dim = 1.0
+        provider.cp_comm_type = "allgather"
 
         # DSA indexer params
         provider.experimental_attention_variant = "dsa"
