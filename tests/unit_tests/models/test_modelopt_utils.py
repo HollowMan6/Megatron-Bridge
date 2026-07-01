@@ -153,6 +153,7 @@ def test_find_modelopt_weight_quantizer_returns_owner_for_weight_param():
 
 
 def test_collect_modelopt_quant_metadata_skips_unquantized_tasks(monkeypatch):
+    monkeypatch.delattr(quant_utils, "QUANTIZATION_W4A16_NVFP4", raising=False)
     quantizer_amax = torch.tensor([-2688.0])
     quant_module = SimpleNamespace(weight_quantizer=SimpleNamespace(_amax=quantizer_amax))
     unquantized_module = SimpleNamespace(weight_quantizer=SimpleNamespace(_amax=torch.tensor([1.0])))
@@ -457,6 +458,28 @@ def test_get_modelopt_quant_exporter_is_case_insensitive_and_rejects_unknown_mod
 
     with pytest.raises(ValueError, match="Unsupported ModelOpt quant_mode"):
         get_modelopt_quant_exporter("w4a8")
+
+
+def test_get_modelopt_quant_exporter_returns_supported_w4a16_format(monkeypatch):
+    w4a16_qformat = "modelopt_w4a16_nvfp4"
+    monkeypatch.setattr(
+        quant_utils,
+        "QUANTIZATION_W4A16_NVFP4",
+        w4a16_qformat,
+        raising=False,
+    )
+
+    qformat, export_weight = get_modelopt_quant_exporter("W4A16_NVFP4")
+
+    assert qformat == w4a16_qformat
+    assert export_weight is quantize_nvfp4_weight
+
+
+def test_get_modelopt_quant_exporter_rejects_unsupported_w4a16(monkeypatch):
+    monkeypatch.delattr(quant_utils, "QUANTIZATION_W4A16_NVFP4", raising=False)
+
+    with pytest.raises(RuntimeError, match="does not support W4A16 NVFP4 export"):
+        get_modelopt_quant_exporter("w4a16_nvfp4")
 
 
 def test_auto_bridge_modelopt_export_quantizes_matching_weights(monkeypatch):

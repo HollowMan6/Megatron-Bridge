@@ -315,15 +315,16 @@ def collect_modelopt_quant_metadata(
     conversion_tasks: list[WeightConversionTask | None],
 ) -> dict[str, QuantMeta]:
     """Collect ModelOpt quantization metadata from conversion task modules."""
+    from modelopt.torch.export import quant_utils
     from modelopt.torch.export.quant_utils import (
         QUANTIZATION_NONE,
         QUANTIZATION_NVFP4,
-        QUANTIZATION_W4A16_NVFP4,
         get_quantization_format,
         get_weight_block_size,
     )
     from modelopt.torch.quantization.qtensor.nvfp4_tensor import NVFP4QTensor
 
+    w4a16_nvfp4 = getattr(quant_utils, "QUANTIZATION_W4A16_NVFP4", None)
     metadata: dict[str, QuantMeta] = {}
     for task in conversion_tasks:
         if task is None or task.megatron_module is None or task.param_weight is None:
@@ -345,7 +346,7 @@ def collect_modelopt_quant_metadata(
             continue
         weight_amax = getattr(weight_quantizer, "_amax", None)
         weight_scale_2 = None
-        if qformat in (QUANTIZATION_NVFP4, QUANTIZATION_W4A16_NVFP4):
+        if qformat == QUANTIZATION_NVFP4 or (w4a16_nvfp4 is not None and qformat == w4a16_nvfp4):
             weight_scale_2 = NVFP4QTensor.get_weights_scaling_factor_2_from_quantizer(weight_quantizer)
 
         metadata[task.global_param_name] = QuantMeta(
@@ -497,16 +498,18 @@ def quantize_nvfp4_weight(
 
 def get_modelopt_quant_exporter(quant_mode: str):
     """Return the ModelOpt quantization format and exporter for a quantization mode."""
-    from modelopt.torch.export.quant_utils import (
-        QUANTIZATION_NVFP4,
-        QUANTIZATION_W4A16_NVFP4,
-    )
+    from modelopt.torch.export import quant_utils
 
-    mode_to_qformat = {
-        "nvfp4": QUANTIZATION_NVFP4,
-        "w4a16_nvfp4": QUANTIZATION_W4A16_NVFP4,
-    }
-    qformat = mode_to_qformat.get(quant_mode.lower())
-    if qformat is None:
+    normalized_mode = quant_mode.lower()
+    if normalized_mode == "nvfp4":
+        qformat = quant_utils.QUANTIZATION_NVFP4
+    elif normalized_mode == "w4a16_nvfp4":
+        qformat = getattr(quant_utils, "QUANTIZATION_W4A16_NVFP4", None)
+        if qformat is None:
+            raise RuntimeError(
+                "The installed nvidia-modelopt version does not support W4A16 NVFP4 export; "
+                "install a version that exposes QUANTIZATION_W4A16_NVFP4."
+            )
+    else:
         raise ValueError(f"Unsupported ModelOpt quant_mode: {quant_mode}")
     return qformat, quantize_nvfp4_weight
