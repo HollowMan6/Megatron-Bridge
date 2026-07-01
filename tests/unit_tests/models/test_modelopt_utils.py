@@ -597,10 +597,6 @@ def test_auto_bridge_modelopt_export_quantizes_matching_weights(monkeypatch):
         "get_modelopt_quant_exporter",
         lambda quant_mode: (QUANTIZATION_NVFP4, fake_export_weight),
     )
-    monkeypatch.setattr(
-        "megatron.bridge.models.conversion.auto_bridge.model_bridge._get_pp_group",
-        lambda _model: None,
-    )
 
     output = list(
         AutoBridge.export_hf_weights_modelopt(
@@ -618,6 +614,66 @@ def test_auto_bridge_modelopt_export_quantizes_matching_weights(monkeypatch):
     ]
     assert bridge.export_calls[0][1]["cpu"] is True
     assert bridge.export_calls[0][1]["conversion_tasks"] is conversion_tasks
+
+
+def test_auto_bridge_modelopt_export_falls_back_to_mapping_registry(monkeypatch):
+    megatron_name = "decoder.layers.0.mlp.up_proj.weight"
+    hf_name = "model.layers.0.mlp.up_proj.weight"
+    conversion_tasks = [_task(megatron_name, hf_name)]
+    bridge = _bridge_for_export(
+        conversion_tasks,
+        [(hf_name, torch.tensor([1.0]))],
+    )
+    quant_meta = _quant_meta()
+    registry_calls = []
+    lookup_calls = []
+
+    def hf_to_megatron_lookup(name):
+        lookup_calls.append(name)
+        return SimpleNamespace(megatron_param=megatron_name)
+
+    registry = SimpleNamespace(hf_to_megatron_lookup=hf_to_megatron_lookup)
+
+    def get_registry():
+        registry_calls.append(True)
+        return registry
+
+    bridge._model_bridge.mapping_registry = get_registry
+
+    def fake_export_weight(name, tensor, meta):
+        assert name == hf_name
+        assert meta is quant_meta
+        yield name, tensor.to(torch.uint8)
+
+    monkeypatch.setattr(
+        modelopt_utils,
+        "collect_modelopt_quant_metadata",
+        lambda _tasks: {megatron_name: quant_meta},
+    )
+    monkeypatch.setattr(
+        modelopt_utils,
+        "build_hf_modelopt_quant_metadata",
+        lambda _tasks, _metadata: {},
+    )
+    monkeypatch.setattr(
+        modelopt_utils,
+        "get_modelopt_quant_exporter",
+        lambda quant_mode: (QUANTIZATION_NVFP4, fake_export_weight),
+    )
+
+    output = list(
+        AutoBridge.export_hf_weights_modelopt(
+            bridge,
+            [object()],
+            conversion_tasks=conversion_tasks,
+        )
+    )
+
+    assert registry_calls == [True]
+    assert lookup_calls == [hf_name]
+    assert [(name, tensor.dtype, tensor.tolist()) for name, tensor in output] == [
+        (hf_name, torch.uint8, [1]),
+    ]
 
 
 def test_auto_bridge_modelopt_export_leaves_ignored_weights_unquantized(monkeypatch):
@@ -644,10 +700,6 @@ def test_auto_bridge_modelopt_export_leaves_ignored_weights_unquantized(monkeypa
         modelopt_utils,
         "get_modelopt_quant_exporter",
         lambda quant_mode: (QUANTIZATION_NVFP4, fail_export_weight),
-    )
-    monkeypatch.setattr(
-        "megatron.bridge.models.conversion.auto_bridge.model_bridge._get_pp_group",
-        lambda _model: None,
     )
 
     output = list(
