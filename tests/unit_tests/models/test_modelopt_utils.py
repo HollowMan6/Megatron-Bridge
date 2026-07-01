@@ -152,6 +152,27 @@ def test_find_modelopt_weight_quantizer_returns_owner_for_weight_param():
     assert quant_module is module
 
 
+def test_iter_modelopt_weight_quantizers_does_not_repeat_calibration_weight():
+    class FakeQuantModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.weight_quantizer = SimpleNamespace(is_enabled=True)
+
+        def iter_weights_for_calibration(self):
+            yield self.weight, self.weight_quantizer
+
+    module = FakeQuantModule()
+
+    matches = list(modelopt_utils._iter_modelopt_weight_quantizers(module))
+
+    assert len(matches) == 1
+    weight, quantizer, can_use_module = matches[0]
+    assert weight is module.weight
+    assert quantizer is module.weight_quantizer
+    assert can_use_module is True
+
+
 def test_collect_modelopt_quant_metadata_skips_unquantized_tasks(monkeypatch):
     monkeypatch.delattr(quant_utils, "QUANTIZATION_W4A16_NVFP4", raising=False)
     quantizer_amax = torch.tensor([-2688.0])
@@ -377,6 +398,63 @@ def test_build_hf_modelopt_quant_metadata_shares_grouped_gated_scale_2():
     torch.testing.assert_close(hf_metadata[up_name].weight_scale_2, expected_scale_2)
 
 
+@pytest.mark.parametrize(
+    ("weight_shape", "weight_scale_2", "expected"),
+    [
+        (
+            (2, 4, 4),
+            torch.tensor([1.0, 0.5]),
+            torch.tensor([[[1.0]], [[0.5]]]),
+        ),
+        (
+            (2, 4, 4),
+            torch.tensor([[1.0], [0.5]]),
+            torch.tensor([[[1.0]], [[0.5]]]),
+        ),
+        (
+            (2, 4, 4),
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            torch.tensor(
+                [
+                    [[1.0], [1.0], [2.0], [2.0]],
+                    [[3.0], [3.0], [4.0], [4.0]],
+                ]
+            ),
+        ),
+    ],
+    ids=["per-expert-vector", "singleton-column", "grouped-scales"],
+)
+def test_reshape_nvfp4_weight_scale_2_for_compute(weight_shape, weight_scale_2, expected):
+    actual = modelopt_utils._reshape_nvfp4_weight_scale_2_for_compute(
+        torch.ones(weight_shape),
+        weight_scale_2,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("weight_shape", "weight_scale_2"),
+    [
+        ((2, 4), torch.tensor([1.0, 0.5])),
+        ((2, 4, 4), torch.tensor(1.0)),
+        ((2, 5, 4), torch.tensor([[1.0, 2.0], [3.0, 4.0]])),
+        ((2, 4, 4), torch.ones(2, 1, 1)),
+    ],
+    ids=["non-3d-weight", "scalar", "non-divisible-groups", "already-reshaped"],
+)
+def test_reshape_nvfp4_weight_scale_2_for_compute_keeps_unsupported_shapes(
+    weight_shape,
+    weight_scale_2,
+):
+    actual = modelopt_utils._reshape_nvfp4_weight_scale_2_for_compute(
+        torch.ones(weight_shape),
+        weight_scale_2,
+    )
+
+    assert actual is weight_scale_2
+
+
 def test_quantize_nvfp4_weight_uses_modelopt_scale_export_and_emits_scale_names(monkeypatch):
     captured = {}
 
@@ -474,6 +552,48 @@ def test_quantize_nvfp4_weight_exports_fused_moe_internal_names(monkeypatch):
     torch.testing.assert_close(
         tensors["model.layers.0.mlp.experts.w13_weight_scale_2"],
         torch.tensor([[1.0, 1.0], [0.5, 0.5]]),
+    )
+    assert captured["weight_scale_2"].shape == (2, 1, 1)
+
+
+def test_quantize_nvfp4_weight_exports_fused_moe_w2_names_and_squeezes_scale_2(monkeypatch):
+    captured = {}
+
+    def fake_to_quantized_weight(
+        weight,
+        weight_scale,
+        qformat,
+        weight_scale_2,
+        block_size,
+    ):
+        captured["weight_scale_2"] = weight_scale_2
+        return torch.zeros(weight.shape, dtype=torch.uint8, device=weight.device)
+
+    monkeypatch.setattr(quant_utils, "to_quantized_weight", fake_to_quantized_weight)
+
+    tensors = dict(
+        quantize_nvfp4_weight(
+            "model.layers.0.mlp.experts.down_proj",
+            torch.ones(2, 4, 4, dtype=torch.float32),
+            QuantMeta(
+                qformat=QUANTIZATION_NVFP4,
+                block_size=4,
+                weight_amax=torch.tensor([[2688.0], [1344.0]]),
+                weight_scale_2=torch.tensor([[1.0], [0.5]]),
+            ),
+        )
+    )
+
+    assert set(tensors) == {
+        "model.layers.0.mlp.experts.w2_weight",
+        "model.layers.0.mlp.experts.w2_weight_scale",
+        "model.layers.0.mlp.experts.w2_weight_scale_2",
+    }
+    assert tensors["model.layers.0.mlp.experts.w2_weight"].dtype == torch.uint8
+    assert tensors["model.layers.0.mlp.experts.w2_weight_scale"].dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(
+        tensors["model.layers.0.mlp.experts.w2_weight_scale_2"],
+        torch.tensor([1.0, 0.5]),
     )
     assert captured["weight_scale_2"].shape == (2, 1, 1)
 

@@ -120,6 +120,7 @@ def _iter_modelopt_weight_quantizers(
                     weight,
                 ),
             )
+        return
 
     weight_quantizer = getattr(module, "weight_quantizer", None)
     if _is_enabled_quantizer(weight_quantizer):
