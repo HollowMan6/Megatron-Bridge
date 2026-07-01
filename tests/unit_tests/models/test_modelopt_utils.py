@@ -294,6 +294,89 @@ def test_build_hf_modelopt_quant_metadata_stacks_synced_grouped_experts():
     )
 
 
+def test_build_hf_modelopt_quant_metadata_slices_non_grouped_gated_amax():
+    gate_name = "model.layers.0.mlp.gate_proj.weight"
+    up_name = "model.layers.0.mlp.up_proj.weight"
+    task = SimpleNamespace(
+        global_param_name="decoder.layers.0.mlp.linear_fc1.weight",
+        mapping=SimpleNamespace(
+            hf_param={"gate": gate_name, "up": up_name},
+            is_grouped_export=False,
+        ),
+    )
+    shared_scale_2 = torch.tensor(0.5)
+    metadata = {
+        task.global_param_name: QuantMeta(
+            qformat=QUANTIZATION_NVFP4,
+            block_size=16,
+            weight_amax=torch.tensor(
+                [
+                    [1.0, 2.0],
+                    [3.0, 4.0],
+                    [5.0, 6.0],
+                    [7.0, 8.0],
+                ]
+            ),
+            weight_scale_2=shared_scale_2,
+        )
+    }
+
+    hf_metadata = build_hf_modelopt_quant_metadata([task], metadata)
+
+    torch.testing.assert_close(
+        hf_metadata[gate_name].weight_amax,
+        torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+    )
+    torch.testing.assert_close(
+        hf_metadata[up_name].weight_amax,
+        torch.tensor([[5.0, 6.0], [7.0, 8.0]]),
+    )
+    torch.testing.assert_close(hf_metadata[gate_name].weight_scale_2, shared_scale_2)
+    torch.testing.assert_close(hf_metadata[up_name].weight_scale_2, shared_scale_2)
+
+
+def test_build_hf_modelopt_quant_metadata_shares_grouped_gated_scale_2():
+    gate_name = "model.layers.0.mlp.experts.gate_proj.weight"
+    up_name = "model.layers.0.mlp.experts.up_proj.weight"
+    task = SimpleNamespace(
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc1.weight0",
+        mapping=SimpleNamespace(
+            hf_param={"gate": gate_name, "up": up_name},
+            is_grouped_export=True,
+        ),
+    )
+    metadata = {
+        f"decoder.layers.0.mlp.experts.linear_fc1.weight{expert_idx}": QuantMeta(
+            qformat=QUANTIZATION_NVFP4,
+            block_size=16,
+            weight_amax=torch.tensor(
+                [
+                    float(expert_idx * 4 + 1),
+                    float(expert_idx * 4 + 2),
+                    float(expert_idx * 4 + 3),
+                    float(expert_idx * 4 + 4),
+                ]
+            ),
+            weight_scale_2=torch.tensor(float(expert_idx + 10)),
+        )
+        for expert_idx in range(2)
+    }
+
+    hf_metadata = build_hf_modelopt_quant_metadata([task], metadata)
+
+    torch.testing.assert_close(
+        hf_metadata[gate_name].weight_amax,
+        torch.tensor([[1.0, 2.0], [5.0, 6.0]]),
+    )
+    torch.testing.assert_close(
+        hf_metadata[up_name].weight_amax,
+        torch.tensor([[3.0, 4.0], [7.0, 8.0]]),
+    )
+    expected_scale_2 = torch.tensor([10.0, 11.0])
+    torch.testing.assert_close(hf_metadata[gate_name].weight_scale_2, expected_scale_2)
+    torch.testing.assert_close(hf_metadata[up_name].weight_scale_2, expected_scale_2)
+
+
 def test_quantize_nvfp4_weight_uses_modelopt_scale_export_and_emits_scale_names(monkeypatch):
     captured = {}
 

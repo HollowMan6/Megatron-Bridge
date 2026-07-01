@@ -302,8 +302,8 @@ def build_hf_modelopt_quant_metadata(
                     )
             continue
 
-        for _, hf_name in hf_items:
-            hf_metadata[hf_name] = meta
+        for hf_key, hf_name in hf_items:
+            hf_metadata[hf_name] = _slice_gated_quant_meta(meta, hf_key)
 
     for hf_name, expert_meta in grouped_metadata.items():
         hf_metadata[hf_name] = _stack_grouped_quant_meta(hf_name, expert_meta)
