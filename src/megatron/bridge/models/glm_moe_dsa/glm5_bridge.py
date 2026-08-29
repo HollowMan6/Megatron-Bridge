@@ -136,6 +136,11 @@ class GLM5Bridge(MegatronModelBridge):
         provider.dsa_indexer_topk_freq = getattr(hf_config, "index_topk_freq", 1)
         provider.dsa_indexer_skip_topk_offset = getattr(hf_config, "index_skip_topk_offset", 0)
         provider.dsa_indexer_rotate_activation = False
+        # TileLang fused indexer (the deployed e36c7a191 line set this;
+        # the upstream merge dropped it and every batch silently fell to
+        # fused_qk_topk_naive's materialized [T, S] scores — long packed
+        # batches OOM at 4x[T,T] fp32, issue mint#1181).
+        provider.dsa_kernel_backend = "tilelang"
         provider.dsa_indexer_k_norm_epsilon = 1e-6
         provider.dsa_indexer_loss_coeff = 0.001
         provider.dsa_indexer_use_sparse_loss = True
