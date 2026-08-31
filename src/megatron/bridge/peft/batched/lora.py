@@ -1315,8 +1315,21 @@ class _ExpertSharedOuterLoRA(torch.autograd.Function):
             h_n = torch.einsum("nri,bi->bnr", a_e, xe)  # [S_e, N, rank]
             h = h_n.gather(1, se.view(-1, 1, 1).expand(-1, 1, rank)).squeeze(1)
             hidden_all[rows] = h
-            b_n = torch.einsum("nor,bnr->bno", b_f, h_n)  # [S_e, N, out]
-            d = b_n.gather(1, se.view(-1, 1, 1).expand(-1, 1, out)).squeeze(1)
+            # Chunked per-slot gather + einsum instead of the N-broadcast
+            # b_n = einsum("nor,bnr->bno") — that materializes [S_e, N, out]
+            # fp32 (N=8x waste; with out=hidden and S_e ~1e4 the buffer hit
+            # ~2 GiB per expert, the fleet OOM at 262k single-seq). The
+            # chunked form gathers this row-block's OWN B factor
+            # ([c, out, rank], same 512 MiB budget as the backward) and
+            # reduces directly to the needed diagonal [c, out].
+            b_e = b_f                          # [N, out, rank] (shared B)
+            _c = max(128, (1 << 29) // max(1, out * rank * 4))
+            S_e = rows.sum().item()
+            d = torch.empty(S_e, out, device=x.device, dtype=torch.float32)
+            for s0 in range(0, S_e, _c):
+                sl = slice(s0, min(s0 + _c, S_e))
+                b_g = b_e[se[sl]]               # [c, out, rank]
+                d[sl] = torch.einsum("sor,sr->so", b_g, h[sl])
             delta[rows] = (d * scale).to(x.dtype)
         ctx.save_for_backward(x, slot_rows, expert_rows, hidden_all, a_pool, b_pool)
         ctx.scale = float(scale)
@@ -1425,8 +1438,18 @@ class _ExpertSharedInnerLoRA(torch.autograd.Function):
             h = h_n.gather(1, se.view(-1, 1, 1).expand(-1, 1, rank)).squeeze(1)
             hidden_all[rows] = h
             b_e = b_f[:, e]                     # [N, out, rank]
-            d_n = torch.einsum("nor,bnr->bno", b_e, h_n)  # [S_e, N, out]
-            d = d_n.gather(1, se.view(-1, 1, 1).expand(-1, 1, out)).squeeze(1)
+            # Chunked per-slot gather + einsum instead of the N-broadcast
+            # d_n = einsum("nor,bnr->bno") — [S_e, N, out] fp32 is N=8x
+            # waste over the needed diagonal (fc1's out=intermediate made
+            # it the 2.58 GiB allocation in the 196k/262k fleet OOM stack).
+            # Same 512 MiB chunk budget as the backward path.
+            _c = max(128, (1 << 29) // max(1, out * rank * 4))
+            S_e = rows.sum().item()
+            d = torch.empty(S_e, out, device=x.device, dtype=torch.float32)
+            for s0 in range(0, S_e, _c):
+                sl = slice(s0, min(s0 + _c, S_e))
+                b_g = b_e[se[sl]]               # [c, out, rank]
+                d[sl] = torch.einsum("sor,sr->so", b_g, h[sl])
             delta[rows] = (d * scale).to(x.dtype)
         ctx.save_for_backward(x, slot_rows, expert_rows, hidden_all, a_pool, b_pool)
         ctx.scale = float(scale)
