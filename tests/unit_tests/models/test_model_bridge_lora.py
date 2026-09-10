@@ -751,12 +751,16 @@ def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
         dim,
         pp_rank,
         vp_stage,
+        is_split_gate_up,
     ) = info[0]
     assert global_base_name == "decoder.layers.0.mlp.linear_fc1.adapter"
     assert local_base_prefix == "decoder.layers.0.mlp.linear_fc1"
     assert input_is_parallel is True and base_linear_is_parallel is True
     assert requires_expert_splits is False
     assert alpha == 8 and dim == 2 and pp_rank == 0 and vp_stage == 0
+    # Split gate/up adapters (SplitGateUpAdapter) are flagged so the
+    # conversion emits one task per pair; a plain ParallelLinearAdapter is not.
+    assert is_split_gate_up is False
 
 
 def test_construct_adapters_names():
@@ -812,6 +816,7 @@ def test_build_adapter_conversion_tasks(monkeypatch):
             8,
             0,
             0,
+            False,
         )
     ]
 
@@ -864,6 +869,7 @@ def test_build_adapter_conversion_tasks_excludes_base_prefix_before_mapping(monk
             8,
             0,
             0,
+            False,
         )
     ]
 
@@ -2601,3 +2607,86 @@ def test_column_parallel_mapping_skips_ep_gather_for_adapters(monkeypatch):
 
     result = mapping.megatron_to_hf(torch.ones(2, 2), None)
     torch.testing.assert_close(result["hf_param"], torch.ones(2, 2))
+
+
+def test_split_gate_up_adapter_emits_one_task_per_half(monkeypatch):
+    """Split gate/up adapters yield ONE conversion task per enumerated pair.
+
+    A SplitGateUpAdapter carries two independent pairs, and
+    _megatron_global_adapters_info_all_pp_ranks enumerates each pair
+    separately (the dedup key is that pair's ``linear_in.weight``). Each
+    entry must therefore emit exactly ONE task, tagged with its half —
+    emitting both halves per entry doubles every split surface (observed as
+    4 tasks per fused fc1 and 312 duplicate PEFT names in the mint shard
+    document).
+    """
+    from megatron.bridge.peft.utils import SplitGateUpAdapter
+    from megatron.bridge.models.conversion.peft_bridge import is_split_gate_up_adapter
+
+    bridge = DummyBridge()
+    bridge.hf_pretrained = SimpleNamespace()
+    bridge.hf_config = bridge.hf_pretrained
+
+    adapter = SplitGateUpAdapter.__new__(SplitGateUpAdapter)
+    torch.nn.Module.__init__(adapter)
+
+    def _holder():
+        return SimpleNamespace(weight=torch.ones(2, 2))
+
+    adapter.linear_in, adapter.linear_out = _holder(), _holder()
+    adapter.up = SimpleNamespace(linear_in=_holder(), linear_out=_holder())
+    adapter.alpha, adapter.dim = 32, 8
+    assert is_split_gate_up_adapter(adapter), "predicate must see the real class"
+
+    # Two entries, exactly as the enumeration emits them: the gate pair
+    # (no suffix) and the up pair (``.up`` suffix), both on the same base.
+    adapters_info = [
+        (
+            "decoder.layers.0.mlp.linear_fc1.adapter",
+            "decoder.layers.0.mlp.linear_fc1",
+            False,
+            False,
+            False,
+            32,
+            8,
+            0,
+            0,
+            True,
+        ),
+        (
+            "decoder.layers.0.mlp.linear_fc1.adapter.up",
+            "decoder.layers.0.mlp.linear_fc1",
+            False,
+            False,
+            False,
+            32,
+            8,
+            0,
+            0,
+            True,
+        ),
+    ]
+
+    monkeypatch.setattr(bridge, "_megatron_global_adapters_info_all_pp_ranks", lambda *_: adapters_info)
+    monkeypatch.setattr(bridge, "_get_adapter_wrap_module", lambda *_: (adapter, None))
+    monkeypatch.setattr(
+        "megatron.bridge.models.conversion.model_bridge.parallel_state.get_pipeline_model_parallel_rank",
+        lambda: 0,
+    )
+    registry = MegatronMappingRegistry(
+        AutoMapping(
+            megatron_param="decoder.layers.*.mlp.linear_fc1.weight",
+            hf_param="decoder.layers.*.mlp.linear_fc1.weight",
+        )
+    )
+    monkeypatch.setattr(bridge, "mapping_registry", lambda: registry)
+
+    tasks = bridge.build_adapter_conversion_tasks([Mock()])[
+        "decoder.layers.0.mlp.linear_fc1"
+    ]
+    assert len(tasks) == 2, "one task per pair (not per pair per entry)"
+    by_half = {t.gate_up_half: t for t in tasks}
+    assert sorted(by_half) == ["gate", "up"]
+    # Each task must carry ITS pair's weights, not the other half's.
+    assert by_half["up"].linear_in_task.param_weight is adapter.up.linear_in.weight
+    assert by_half["gate"].linear_in_task.param_weight is adapter.linear_in.weight

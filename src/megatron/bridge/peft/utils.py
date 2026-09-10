@@ -1920,6 +1920,87 @@ def _make_grouped_expert_sharded_tensor(
     )
 
 
+class SplitGateUpAdapter(ParallelLinearAdapter):
+    """Independent gate/up LoRA pairs on a fused gate-up linear.
+
+    Reference-platform alignment (tinker-official-reference
+    models/glm-5.3.md): the Tinker GLM-5.x adapters carry INDEPENDENT
+    ``gate_proj`` / ``up_proj`` A/B tensors on the fc1 projection
+    (checkpoint-verified: ``gateA != upA`` on the dense and shared-expert
+    surfaces; the routed experts are fused on both sides). Megatron fuses
+    gate+up into one ``linear_fc1``, so a single ``ParallelLinearAdapter``
+    would force one rank-r input subspace and one summed A-gradient
+    trajectory on both halves (mint #1072 class). This class holds TWO
+    independent pairs and concatenates their deltas in the fused output
+    layout ([gate; up] on the last dim).
+
+    Parameter layout (per rank, TP sharding as the base class):
+    ``linear_in`` / ``linear_out`` = the GATE pair (inherited
+    attributes); ``up.linear_in`` / ``up.linear_out`` = the UP pair. The
+    halves split the fused output dim in two (``out_features // 2``
+    each).
+    """
+
+    def __init__(self, in_features: int, out_features: int, dim: int, **kwargs: Any) -> None:
+        """Build the gate pair via the base class and an identical up pair.
+
+        Args:
+            in_features: Input feature dimension.
+            out_features: FUSED output feature dimension (gate + up).
+            dim: Adapter bottleneck dimension.
+            **kwargs: Forwarded verbatim to :class:`ParallelLinearAdapter`
+                for both pairs.
+        """
+        if out_features % 2 != 0:
+            raise ValueError(
+                "SplitGateUpAdapter requires an even fused output dim "
+                f"(gate + up), got {out_features}"
+            )
+        super().__init__(in_features, out_features // 2, dim, **kwargs)
+        self.up = ParallelLinearAdapter(in_features, out_features // 2, dim, **kwargs)
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        """Return the concatenated [gate; up] adapter delta."""
+        gate = super().forward(x, *args, **kwargs)
+        up = self.up(x, *args, **kwargs)
+        return torch.cat([gate, up], dim=-1)
+
+    def pairs(self) -> tuple[tuple[nn.Module, nn.Module], tuple[nn.Module, nn.Module]]:
+        """Return ((gate_in, gate_out), (up_in, up_out)) for init/export seams."""
+        return (self.linear_in, self.linear_out), (self.up.linear_in, self.up.linear_out)
+
+    def merged_weight(self, base_weight: torch.Tensor, tp_group: object | None = None) -> torch.Tensor:
+        """Return the effective fused weight (base + [gate delta; up delta]).
+
+        Each half merges against its own row slice of the fused base weight
+        (the fused layout is [gate rows; up rows]) so the result matches
+        ``base_weight``. Used by the effective-weight path
+        (``LoRALinear.weight``) and merged exports.
+        """
+        from megatron.bridge.peft.lora_merge import LoRAMerge
+
+        merge = LoRAMerge()
+        group = tp_group if tp_group is not None else getattr(self, "tp_group", None)
+        half = base_weight.shape[0] // 2
+        gate = merge.merge(
+            base_weight[:half],
+            self.linear_out.weight,
+            self.linear_in.weight,
+            self.alpha,
+            self.dim,
+            tp_group=group,
+        )
+        up = merge.merge(
+            base_weight[half:],
+            self.up.linear_out.weight,
+            self.up.linear_in.weight,
+            self.up.alpha,
+            self.up.dim,
+            tp_group=group,
+        )
+        return torch.cat([gate, up], dim=0)
+
+
 class _GroupedExpertAdapterWeight(nn.Module):
     """Callable parameter container so DDP forward pre-hooks see grouped LoRA weights."""
 

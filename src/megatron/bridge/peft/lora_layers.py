@@ -39,6 +39,19 @@ class LoRALinear(AdapterWrapper):
         if not self._adapter_enabled:
             return base_weight
 
+        if hasattr(self.adapter, "merged_weight"):
+            # Split gate/up adapters hold two pairs and merge each against its
+            # own row slice of the fused base weight.
+            merged_weight = self.adapter.merged_weight(
+                base_weight, getattr(self.adapter, "tp_group", None)
+            )
+            if merged_weight.shape != base_weight.shape:
+                raise RuntimeError(
+                    "LoRA effective weight shape mismatch: "
+                    f"base={tuple(base_weight.shape)}, merged={tuple(merged_weight.shape)}"
+                )
+            return merged_weight.to(device=base_weight.device, dtype=base_weight.dtype)
+
         linear_in_weight = self.adapter.linear_in.weight
         linear_out_weight = self.adapter.linear_out.weight
 

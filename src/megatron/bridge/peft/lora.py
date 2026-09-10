@@ -36,6 +36,7 @@ from megatron.bridge.peft.utils import (
     GroupedExpertLinearAdapter,
     ParallelLinearAdapter,
     SharedOuterGroupedExpertAdapter,
+    SplitGateUpAdapter,
     align_expert_dim_for_tp,
     get_adapter_attributes_from_linear,
     get_effective_lora_dim,
@@ -138,6 +139,16 @@ class LoRA(PEFT, ModuleMatcher):
             SGLang's ``experts_shared_outer_loras=True`` serving contract (PR
             #21466). Default False preserves the adapter layout selected by
             ``share_expert_adapters``.
+        split_gate_up_adapters (bool): When True, a fused gate-up linear
+            (megatron ``linear_fc1`` with ``gated_linear_unit=True``, dense MLP
+            and shared-expert surfaces) gets TWO independent rank-``dim``
+            adapter pairs — one per half of the fused output — instead of one
+            pair shared by both halves. Matches the reference platform's
+            independent ``gate_proj`` / ``up_proj`` adapters
+            (tinker-official-reference models/glm-5.3.md; checkpoint-verified
+            ``gateA != upA``). Default False keeps the fused single-pair
+            topology (reference behaviour for the routed grouped-expert
+            surfaces, where the platform also fuses).
     """
 
     target_modules: List[str] = field(
@@ -155,6 +166,7 @@ class LoRA(PEFT, ModuleMatcher):
     normalize_moe_lora: bool = False
     share_expert_adapters: bool = True
     experts_shared_outer_loras: bool = False
+    split_gate_up_adapters: bool = False
 
     def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
         """
@@ -209,9 +221,20 @@ class LoRA(PEFT, ModuleMatcher):
                 is_grouped_expert_name and not self.share_expert_adapters and not use_shared_outer_adapter
             )
             use_grouped_expert_adapter = use_shared_outer_adapter or use_per_expert_adapter
+            # Fused gate-up surfaces (megatron ``linear_fc1`` of a gated MLP:
+            # dense and shared-expert) get independent gate/up pairs when the
+            # caller opts in — the reference platform's per-projection
+            # adapters. Grouped routed-expert fc1 stays fused on both sides.
+            use_split_gate_up_adapter = (
+                self.split_gate_up_adapters
+                and not is_grouped_expert_name
+                and str(full_name).endswith("linear_fc1")
+                and bool(getattr(module.config, "gated_linear_unit", False))
+            )
 
             enable_op_fuser = (
                 not use_grouped_expert_adapter
+                and not use_split_gate_up_adapter
                 and not is_expert
                 and getattr(module.config, "use_transformer_engine_op_fuser", False)
                 # TP not yet supported
@@ -223,6 +246,8 @@ class LoRA(PEFT, ModuleMatcher):
                 adapter_cls = SharedOuterGroupedExpertAdapter
             elif use_per_expert_adapter:
                 adapter_cls = GroupedExpertLinearAdapter
+            elif use_split_gate_up_adapter:
+                adapter_cls = SplitGateUpAdapter
             else:
                 adapter_cls = ParallelLinearAdapter
             adapter_kwargs = dict(
