@@ -98,6 +98,21 @@ MEGATRON_TO_HF_LORA_SUFFIX = {
 GDN_IN_PROJ_KEYS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
 
 
+def is_split_gate_up_adapter(adapter: object) -> bool:
+    """Return True for a bridge SplitGateUpAdapter (duck-typed, lazy import).
+
+    Split gate/up adapters hold two independent rank-dim pairs on a fused
+    gate-up linear; the export emits one conversion task per half. The
+    import stays lazy to avoid a module-level cycle between the PEFT
+    layers and this conversion module.
+    """
+    try:
+        from megatron.bridge.peft.utils import SplitGateUpAdapter
+    except ImportError:
+        return False
+    return isinstance(adapter, SplitGateUpAdapter)
+
+
 @dataclass(frozen=True)
 class AdapterWeightConversionTask:
     """Task describing an adapter's LoRA weights for conversion or merging."""
@@ -109,6 +124,10 @@ class AdapterWeightConversionTask:
     linear_in_task: "WeightConversionTask"
     linear_out_task: "WeightConversionTask"
     requires_expert_splits: bool = False
+    # Split gate/up adapters (SplitGateUpAdapter) emit one task per half;
+    # the streaming loop filters the base HF names to this half's
+    # projection (gate_proj / up_proj) instead of slicing a fused tensor.
+    gate_up_half: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -549,10 +568,10 @@ class MegatronPeftBridge:
 
     def _megatron_global_adapters_info_all_pp_ranks(
         self, megatron_model: Union[MegatronModel, List[MegatronModel]]
-    ) -> List[tuple[str, str, bool, bool, bool, int, int, int, int]]:
+    ) -> List[tuple[str, str, bool, bool, bool, int, int, int, int, bool]]:
         """Get all adapters' information tuple:
          (global_base_name, local_base_prefix, input_is_parallel, base_linear_is_parallel,
-          requires_expert_splits, alpha, dim, pp_rank, vp_stage)
+          requires_expert_splits, alpha, dim, pp_rank, vp_stage, is_split_gate_up)
         across all pipeline parallel ranks."""
         # Cache the result after first call
         if hasattr(self, "_cached_param_objects_adapter"):
@@ -566,7 +585,7 @@ class MegatronPeftBridge:
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         pp_rank = get_pg_rank(pp_group)
         model_config = unwrap_model(megatron_model)[0].config
-        global_param_objects: List[tuple[str, str, bool, bool, bool, int, int, int, int]] = []
+        global_param_objects: List[tuple[str, str, bool, bool, bool, int, int, int, int, bool]] = []
 
         for vp_stage, model in enumerate(megatron_model):
             for local_param_name, _ in itertools.chain(model.named_parameters(), persistent_buffers(model)):  # type: ignore[name-defined]
@@ -618,6 +637,7 @@ class MegatronPeftBridge:
                         adapter.dim,
                         pp_rank,
                         vp_stage,
+                        is_split_gate_up_adapter(adapter),
                     )
                 )
 
@@ -692,6 +712,7 @@ class MegatronPeftBridge:
             dim,
             pp_rank,
             vp_stage,
+            is_split_gate_up,
         ) in adapters_info:
             # global_base_name example: decoder.layers.0.mlp.linear_fc1.adapter.adapter_q
             global_base_prefix, _, adapter_suffix = global_base_name.partition(".adapter")
@@ -724,6 +745,7 @@ class MegatronPeftBridge:
 
             linear_in_module, linear_in_weight = None, None
             linear_out_module, linear_out_weight = None, None
+            adapter = None
             if parallel_state.get_pipeline_model_parallel_rank() == pp_rank:
                 adapter, _ = self._get_adapter_wrap_module(local_base_prefix, megatron_model, vp_stage)
                 if isinstance(adapter, ModuleDict):
@@ -733,6 +755,70 @@ class MegatronPeftBridge:
                 local_linear_in_name, local_linear_out_name = self._construct_adapters_names(
                     local_base_prefix, adapter_key
                 )
+
+            if is_split_gate_up:
+                # Split gate/up adapter: two independent pairs, one per half of
+                # the fused fc1 output. Each pair is enumerated SEPARATELY by
+                # _megatron_global_adapters_info_all_pp_ranks (the dedup key is
+                # the pair's own ``linear_in.weight``), so this entry owns
+                # exactly ONE half — the up pair's parameter names carry the
+                # ``.up`` suffix, the gate pair's do not. Emitting both halves
+                # here would double every split surface (observed as 4 tasks
+                # per fused fc1 and 312 duplicate PEFT names in the mint shard
+                # document), so the half is derived from this entry.
+                if base_linear_is_parallel:
+                    half_in_mapping_cls = RowParallelMapping if input_is_parallel else ColumnParallelMapping
+                    half_out_mapping_cls = ColumnParallelMapping
+                else:
+                    half_in_mapping_cls = ReplicatedMapping
+                    half_out_mapping_cls = ReplicatedMapping
+                half = "up" if adapter_suffix.strip(".") == "up" else "gate"
+                if adapter is not None:
+                    pair = adapter if half == "gate" else adapter.up
+                    half_in_module, half_out_module = pair.linear_in, pair.linear_out
+                    half_in_weight, half_out_weight = pair.linear_in.weight, pair.linear_out.weight
+                else:
+                    half_in_module, half_out_module = None, None
+                    half_in_weight, half_out_weight = None, None
+                half_global_in = f"{global_linear_in_name}.{half}"
+                half_global_out = f"{global_linear_out_name}.{half}"
+                half_local_in = f"{local_linear_in_name}.{half}"
+                half_local_out = f"{local_linear_out_name}.{half}"
+                tasks_by_base[global_base_prefix].append(
+                    AdapterWeightConversionTask(
+                        global_base_prefix=global_base_prefix,
+                        adapter_key=adapter_key,
+                        alpha=alpha,
+                        dim=dim,
+                        requires_expert_splits=requires_expert_splits,
+                        linear_in_task=WeightConversionTask(
+                            param_name=half_local_in,
+                            global_param_name=half_global_in,
+                            mapping=half_in_mapping_cls(
+                                megatron_param=half_local_in,
+                                hf_param=hf_linear_in_name,
+                            ),
+                            pp_rank=pp_rank,
+                            vp_stage=vp_stage,
+                            megatron_module=half_in_module,
+                            param_weight=half_in_weight,
+                        ),
+                        linear_out_task=WeightConversionTask(
+                            param_name=half_local_out,
+                            global_param_name=half_global_out,
+                            mapping=half_out_mapping_cls(
+                                megatron_param=half_local_out,
+                                hf_param=hf_linear_out_name,
+                            ),
+                            pp_rank=pp_rank,
+                            vp_stage=vp_stage,
+                            megatron_module=half_out_module,
+                            param_weight=half_out_weight,
+                        ),
+                        gate_up_half=half,
+                    )
+                )
+                continue
 
             # Pick mapping strategies based on base layer parallelism
             if base_linear_is_parallel:
@@ -997,6 +1083,24 @@ class MegatronPeftBridge:
                     adapter_task.adapter_key,
                     base_suffix,
                 )
+                if adapter_task.gate_up_half is not None:
+                    # Split gate/up adapter half: this task carries the half's
+                    # OWN pair, so map it to the matching single HF base and
+                    # skip the fused-tensor slicing below (the halves carry
+                    # different A tensors, unlike the fused routed-expert
+                    # case where one adapter feeds both bases).
+                    marker = f".{adapter_task.gate_up_half}_proj."
+                    half_names = [name for name in base_hf_weight_names if marker in name]
+                    if len(half_names) != 1:
+                        raise ValueError(
+                            "split gate/up adapter: expected exactly one "
+                            f"{adapter_task.gate_up_half}_proj base for "
+                            f"{adapter_task.global_base_prefix}, got {base_hf_weight_names}"
+                        )
+                    linear_in_hf_names, linear_out_hf_names = self._build_lora_hf_names(half_names)
+                    yield HFWeightTuple(linear_in_hf_names[0], current_linear_in_tensor)
+                    yield HFWeightTuple(linear_out_hf_names[0], current_linear_out_tensor)
+                    continue
                 linear_in_hf_names, linear_out_hf_names = self._build_lora_hf_names(base_hf_weight_names)
                 if adapter_task.adapter_key is None:
                     # Handle fused adapters (e.g., gate/up or q/k/v) by splitting the fused tensor
