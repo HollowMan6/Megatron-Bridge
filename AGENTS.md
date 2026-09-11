@@ -28,3 +28,15 @@ mirror of `upstream/main`.
 - Deployment consumers pin this repo by exact rev (see mint
   `recipes/*/megatron/pyproject.toml` `[tool.mint.libs]`); changing a
   pin requires re-running the consumer's verification gates.
+
+## Fork Notes (MindLab-Research)
+
+- `main` carries this fork's work and syncs from `NVIDIA-NeMo/Megatron-Bridge`
+  `main` by merge.
+- The `all/*` refs belong to a separate contributor's line; they are not part of
+  this line and are not merged into it.
+- GLM-5 model support lives here (`src/megatron/bridge/models/glm_moe_dsa/`) and
+  depends only on `GPTModel` plus
+  `megatron/core/models/gpt/experimental_attention_variant_module_specs` from
+  Megatron-LM.
+- The batched multi-LoRA kernels live in `src/megatron/bridge/peft/batched/`.
