@@ -28,6 +28,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import transformer_engine.pytorch as te
 
+from megatron.bridge.peft.batched.lora import BatchedLoraAdapter
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.peft.lora_layers import (
     LinearAdapter,
@@ -90,6 +91,20 @@ class MockLoRAAdapter(nn.Module):
     def forward(self, x):
         """Return only the scaled LoRA delta."""
         return self.linear_out(self.linear_in(x)) * self.scale
+
+
+class PoolBackedLoRAAdapter(BatchedLoraAdapter):
+    """A pool-backed adapter stand-in that holds no Parameters.
+
+    The real adapter reads its A/B rows from engine-owned pool tensors passed at forward
+    time, so it never owns a Parameter -- which is exactly the property that makes the
+    merge path in ``LoRALinear.weight`` unusable for it. Bypassing the heavy constructor
+    keeps that property visible in the test.
+    """
+
+    def __init__(self):
+        """Initialize as a bare module: no Parameters, no buffers."""
+        nn.Module.__init__(self)
 
 
 class TestLoRALinear:
@@ -165,6 +180,36 @@ class TestLoRALinear:
         lora_linear.disable_adapter_layers()
 
         assert lora_linear.weight is base.weight
+
+    def test_lora_linear_weight_returns_base_weight_for_pool_backed_adapter(self):
+        """A pool-backed adapter has no merged weight, so .weight must expose the base one.
+
+        The pool holds the delta and the absorbed MLA forward applies it per token, so there
+        is nothing to merge here; before the pool-backed branch existed this raised
+        AttributeError on the missing linear_in parameter.
+        """
+        base = MockLinearWithTupleReturn(in_features=3, out_features=2)
+        adapter = PoolBackedLoRAAdapter()
+        lora_linear = LoRALinear(base, adapter)
+
+        assert not list(adapter.parameters()), "the stand-in must carry no Parameters"
+        assert lora_linear.weight is base.weight
+
+    def test_lora_linear_weight_still_merges_for_parameterised_adapter(self):
+        """The pool-backed branch must not swallow the ordinary single-slot merge path."""
+        base = MockLinearWithTupleReturn(in_features=3, out_features=2)
+        adapter = MockLoRAAdapter(in_features=3, out_features=2, dim=2, alpha=4)
+
+        with torch.no_grad():
+            base.weight.copy_(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
+            adapter.linear_in.weight.copy_(torch.tensor([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]))
+            adapter.linear_out.weight.copy_(torch.tensor([[0.7, 0.8], [0.9, 1.0]]))
+
+        lora_linear = LoRALinear(base, adapter)
+        expected = base.weight + adapter.scale * (adapter.linear_out.weight @ adapter.linear_in.weight)
+
+        assert not isinstance(adapter, BatchedLoraAdapter)
+        assert torch.allclose(lora_linear.weight, expected)
 
     def test_lora_linear_bias_returns_base_bias(self):
         """Test that LoRALinear.bias exposes the wrapped module bias."""
