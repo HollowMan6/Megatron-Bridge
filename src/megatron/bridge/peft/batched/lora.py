@@ -1155,6 +1155,19 @@ def batched_lora_delta(lora_module: BatchedLoraAdapter, x: torch.Tensor, lora_ex
 # slots; the expert forward then reads per-row slots aligned with x.
 #
 
+# Opt-in fail-fast guards for the fused-map derivation below. Each guard
+# reads a device scalar back to the host (``rows.min()`` / ``rows.max()`` /
+# ``(perm1 < 0).any()`` -> ``bool``), i.e. a blocking D2H copy at the tail of
+# the current stream. The helper runs once per MoE layer per pass, called
+# from ``MoEAlltoAllTokenDispatcher.dispatch_preprocess`` ahead of the
+# dispatch all-to-all, so these reads put three host synchronizations per
+# call on the dispatch path. They are diagnostic only — the returned slot
+# vector is identical whether or not they run — hence off by default; set
+# this to True locally to fail fast while debugging a fused-map contract
+# violation.
+_VERIFY_RELAY_DEVICE_GUARDS = False
+
+
 class ExpertSlotRelay:
     """Relay of per-token LoRA slots through the MoE token dispatcher.
 
@@ -1192,7 +1205,9 @@ class ExpertSlotRelay:
 
         The full-coverage assert fail-fasts if a future fused variant
         (e.g. a padded layout where permuted rows exceed routed pairs)
-        reaches this code.
+        reaches this code. It is opt-in via ``_VERIFY_RELAY_DEVICE_GUARDS``
+        (see the note above the class): its device reads force host
+        synchronizations in the dispatch path.
         """
         S, width = row_id_map.shape
         num_experts = (width - 1) // 2
@@ -1203,7 +1218,7 @@ class ExpertSlotRelay:
         )  # [S, E] k-th routed slot of each token
         rows = row_id_map[:, :num_experts][take].long()
         toks = take.nonzero(as_tuple=False)[:, 0]
-        if (
+        if _VERIFY_RELAY_DEVICE_GUARDS and (
             rows.numel() != num_out
             or (rows.numel() and (rows.min() < 0 or rows.max() >= num_out))
         ):
@@ -1214,7 +1229,7 @@ class ExpertSlotRelay:
             )
         perm1 = local_slots.new_full((num_out,), -1)
         perm1.index_copy_(0, rows, local_slots[toks])
-        if bool((perm1 < 0).any()):
+        if _VERIFY_RELAY_DEVICE_GUARDS and bool((perm1 < 0).any()):
             raise RuntimeError(
                 "expert slot relay: fused row_id_map does not cover all "
                 f"{num_out} permuted rows"
