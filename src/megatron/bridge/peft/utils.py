@@ -2669,6 +2669,16 @@ class PackedPerExpertLinear(nn.Module):
         # DDP routes ``is_expert`` weights through the EDP group; the cross-EP
         # axis is naturally distinct here (different experts on each EP rank).
         setattr(self.weight, "allreduce", False)
+        # Norm-filter admission: each EP rank's packed weight is a UNIQUE logical
+        # parameter (its own local experts), not a TP-sharded slice — the grad-norm
+        # filter's tensor-parallel-duplicate check must admit it on EVERY rank, not
+        # just the TP-group rank 0. ``tensor_model_parallel=True`` short-circuits
+        # param_is_not_tensor_parallel_duplicate to "keep" (the tag's meaning here:
+        # "unique per rank", same contract as a TP-sharded slice which is also kept
+        # everywhere). Without it, the packed per-expert weight falls through to
+        # tp_group.rank() == 0 and 3/4 of the per-expert gradient mass is silently
+        # dropped from the reported norm (mint#1594's adjacent finding).
+        setattr(self.weight, "tensor_model_parallel", True)
 
     def forward(self, x: torch.Tensor, m_splits) -> Tuple[torch.Tensor, None]:
         # torch._grouped_mm expects mat2 as [num_groups, K, N]; our weight is

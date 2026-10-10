@@ -1603,6 +1603,28 @@ class TestExpertParallelReplicatedGradSync:
         assert mock_broadcast.call_args.args[0] is shared.weight
         assert mock_broadcast.call_args.kwargs == {"src": 7, "group": ep_group}
 
+    def test_packed_per_expert_linear_tags_norm_admission(self):
+        """The packed 3D weight carries the TP-admission tag for the grad-norm filter.
+
+        Each EP rank's packed weight is a UNIQUE logical parameter (its own local
+        experts), so mcore's ``param_is_not_tensor_parallel_duplicate`` must admit
+        it on every rank. Without the ``tensor_model_parallel`` tag it falls
+        through to ``tp_group.rank() == 0`` and the per-expert gradient mass is
+        dropped from the reported norm on 3/4 of TP ranks (mint#1594's adjacent
+        finding: measured +2.7% gnorm when restored on the 4x8 H20 rig).
+        """
+        if not hasattr(torch, "_grouped_mm"):
+            pytest.skip("torch._grouped_mm unavailable (torch < 2.9)")
+        layer = PackedPerExpertLinear(
+            num_local_experts=2,
+            in_features=2,
+            out_features=2,
+        )
+        assert layer.weight.allreduce is False, "expert-DP routing marker"
+        assert layer.weight.tensor_model_parallel is True, (
+            "norm-admission marker: unique-per-rank params must not be TP-deduped"
+        )
+
 
 class TestGroupedExpertLinearAdapter:
     """Tests for grouped-expert per-expert LoRA adapters."""
