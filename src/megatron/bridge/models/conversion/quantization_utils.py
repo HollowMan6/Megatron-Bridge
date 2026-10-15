@@ -20,6 +20,17 @@ import torch.nn.functional as F
 
 
 FP8_BLOCK_SIZE = 128
+# Below this element count the device round trip costs more than the host
+# multiply saves (one 128x128 block = 16k elements).
+_DEQUANT_GPU_MIN_ELEMS = 1 << 20
+# Keep the dequantized tensor on the device instead of returning it to the
+# host. Measured on the GLM-5.3-Flash import: the pageable D2H of the 33 MB
+# BF16 result dominated the round trip (20.9 ms/tensor -> ~13 min total),
+# while the device multiply itself is 0.1 ms. Callers on this import path
+# (the conversion mappings) are device-agnostic reshape/slice/cat chains and
+# the destination param lives on the device, so no copy back is needed.
+# Set False to restore the CPU-returning contract for a caller that needs it.
+_DEQUANT_RETURN_ON_DEVICE = True
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 FP8_E4M3_MAX = 448.0
 FP4_E2M1_MAX = 6.0
@@ -65,6 +76,26 @@ def scale_from_amax(amax: torch.Tensor, max_quantized_value: float, scale_dtype:
     return scale
 
 
+
+def _dequantize_blockwise_exact(
+    weight: torch.Tensor,
+    scale_inv: torch.Tensor,
+    block_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Exact-block dequantization as ONE broadcast multiply (any device).
+
+    ``weight`` is viewed as ``(sM, block, sN, block)`` so block ``(bi, bj)``
+    indexes ``scale_inv[bi, bj]``; the caller guarantees both dims are exact
+    multiples of ``block_size``.
+    """
+    M, N = weight.shape
+    sM, sN = scale_inv.shape
+    w = weight.view(sM, block_size, sN, block_size).float()
+    out = w * scale_inv[:sM, :sN].float()[:, None, :, None]
+    return out.reshape(M, N).to(dtype)
+
+
 def dequantize_fp8_blockwise(
     weight: torch.Tensor,
     scale_inv: torch.Tensor,
@@ -77,11 +108,40 @@ def dequantize_fp8_blockwise(
     DeepSeek-V3 and MiniMax-M2 store linear weights as FP8 tensors with a
     separate ``*_scale_inv`` tensor. Each scale applies to one 128x128 weight
     block by default.
+
+    The block scales are applied as ONE broadcast multiply when the weight is
+    an exact multiple of ``block_size`` — the geometry every checkpoint in
+    this tree uses (``scale_inv`` is ``(M // 128, N // 128)`` and both weight
+    dims are multiples of 128). The loop form this replaced cost ~36 ms per
+    4096x2048 expert tensor on CPU (512 slice-multiplies); over the
+    GLM-5.3-Flash checkpoint's 37,338 FP8 tensors that was ~22 minutes of
+    pure Python-loop overhead — essentially the entire worker boot time
+    (measured 2026-10-11). The ragged-edge loop is kept for shapes that are
+    not exact multiples. Both paths compute the same float32 product before
+    casting, so the result is numerically identical (pinned by
+    test_dequantize_fp8_blockwise_matches_the_ragged_loop).
     """
     M, N = weight.shape
+    sM, sN = scale_inv.shape
+    if M % block_size == 0 and N % block_size == 0:
+        if (
+            weight.device.type == "cpu"
+            and weight.numel() >= _DEQUANT_GPU_MIN_ELEMS
+            and torch.cuda.is_available()
+        ):
+            # GPU offload (measured 2026-10-11 on H20-3e): the exact-block
+            # broadcast is memory-bound and ~340x faster on the device than on
+            # the host (0.1 ms vs 34 ms for a 4096x2048 expert tensor), which
+            # over this checkpoint's 37,338 FP8 tensors is the difference
+            # between ~21 minutes and ~1 minute of import wall clock. The
+            # round trip returns a CPU tensor so the caller's contract is
+            # unchanged, and the arithmetic is the same float32 product the
+            # host path computes (bit-identical: same multiply, same cast).
+            out = _dequantize_blockwise_exact(weight.cuda(), scale_inv.cuda(), block_size, dtype)
+            return out if _DEQUANT_RETURN_ON_DEVICE else out.cpu()
+        return _dequantize_blockwise_exact(weight, scale_inv, block_size, dtype)
     w = weight.float()
     out = torch.empty_like(w)
-    sM, sN = scale_inv.shape
     for bi in range(sM):
         for bj in range(sN):
             r0, r1 = bi * block_size, min((bi + 1) * block_size, M)

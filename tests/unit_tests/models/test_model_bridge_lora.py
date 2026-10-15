@@ -2690,3 +2690,78 @@ def test_split_gate_up_adapter_emits_one_task_per_half(monkeypatch):
     # Each task must carry ITS pair's weights, not the other half's.
     assert by_half["up"].linear_in_task.param_weight is adapter.up.linear_in.weight
     assert by_half["gate"].linear_in_task.param_weight is adapter.linear_in.weight
+
+
+
+
+def test_dequantize_fp8_blockwise_matches_the_ragged_loop():
+    """The vectorized exact-block path must agree bit-for-bit with the
+    reference loop (the ragged path is the same code the fast path replaced).
+    Guards the GLM-5.3-Flash import: 37,338 tensors ride this function, and a
+    silent numeric drift here would move every weight in the model."""
+    import torch
+
+    from megatron.bridge.models.conversion.quantization_utils import (
+        dequantize_fp8_blockwise,
+    )
+
+    torch.manual_seed(0)
+
+    def ragged_reference(weight, scale_inv, block_size=128, dtype=torch.bfloat16):
+        M, N = weight.shape
+        w = weight.float()
+        out = torch.empty_like(w)
+        sM, sN = scale_inv.shape
+        for bi in range(sM):
+            for bj in range(sN):
+                r0, r1 = bi * block_size, min((bi + 1) * block_size, M)
+                c0, c1 = bj * block_size, min((bj + 1) * block_size, N)
+                out[r0:r1, c0:c1] = w[r0:r1, c0:c1] * scale_inv[bi, bj]
+        return out.to(dtype)
+
+    # Exact-block geometry (the checkpoint's): both dims multiples of 128.
+    for (M, N) in [(256, 128), (512, 256), (4096, 2048)]:
+        w = torch.randn(M, N).to(torch.float8_e4m3fn)
+        s = torch.rand(M // 128, N // 128, dtype=torch.float32) * 0.5 + 0.1
+        fast = dequantize_fp8_blockwise(w, s)
+        ref = ragged_reference(w, s)
+        assert fast.shape == ref.shape
+        assert torch.equal(fast, ref), f"fast path diverged at {(M, N)}"
+
+    # Ragged geometry must still work (loop path).
+    w = torch.randn(300, 200).to(torch.float8_e4m3fn)
+    s = torch.rand(3, 2, dtype=torch.float32) * 0.5 + 0.1
+    out = dequantize_fp8_blockwise(w, s)
+    assert out.shape == (300, 200)
+    assert torch.equal(out, ragged_reference(w, s))
+
+
+def test_shard_readahead_is_best_effort(tmp_path):
+    """The readahead helper must never break a load: a missing file, a
+    directory, or a platform without posix_fadvise all fall through silently.
+    The win it buys on the real mount is 4.5-7.6x on cold shards (measured),
+    and the load must not trade that for a new failure mode."""
+    from megatron.bridge.models.hf_pretrained import state as state_mod
+
+    # A real file: call must succeed and leave the file readable.
+    f = tmp_path / "shard.safetensors"
+    f.write_bytes(b"\0" * 4096)
+    state_mod._issue_shard_readahead(f)
+    assert f.read_bytes() == b"\0" * 4096
+
+    # Missing path and a directory: silent no-ops, no exception.
+    state_mod._issue_shard_readahead(tmp_path / "nope.safetensors")
+    state_mod._issue_shard_readahead(tmp_path)
+
+    # Platform without fadvise: monkeypatch it away and confirm the helper
+    # still swallows the AttributeError.
+    import os
+
+    had = hasattr(os, "posix_fadvise")
+    if had:
+        orig = os.posix_fadvise
+        del os.posix_fadvise
+        try:
+            state_mod._issue_shard_readahead(f)
+        finally:
+            os.posix_fadvise = orig

@@ -37,6 +37,32 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+def _issue_shard_readahead(file_path) -> None:
+    """Pull a whole checkpoint shard into the page cache before reading it.
+
+    Checkpoints on a FUSE/NAS mount are read through safetensors' mmap, which
+    demand-faults in small chunks: measured cold at ~30 MB/s on mint's dev pod
+    (H20-3e, 8 ranks) versus ~421 MB/s with multi-MB requests — a 13x headroom
+    the mmap path never uses. One ``posix_fadvise(WILLNEED)`` per shard turns
+    those demand faults into kernel readahead; measured 4.5-7.6x faster on cold
+    shards (5.3 GB shard: 5.30 s -> 0.70 s). The call is best-effort and never
+    fails a load: platforms without fadvise, or files that vanish between the
+    stat and the open, simply keep the previous behaviour.
+    """
+    try:
+        import os
+
+        fd = os.open(file_path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_WILLNEED)
+    except (AttributeError, OSError):
+        pass
+    finally:
+        os.close(fd)
+
+
 
 def _validate_safetensors_shard_filename(filename: object, *, tensor_key: str, index_file: Path) -> str:
     """Validate a shard filename loaded from a safetensors index."""
@@ -612,6 +638,7 @@ class SafeTensorsStateSource(StateSource):
             for filename, keys_in_file in file_to_keys_map.items():
                 file_path = self.path / filename
                 if file_path.exists():
+                    _issue_shard_readahead(file_path)
                     for attempt in range(max_retries):
                         with safe_open(file_path, framework="pt", device="cpu") as f:
                             file_keys = set(f.keys())
@@ -638,6 +665,7 @@ class SafeTensorsStateSource(StateSource):
             for safetensor_file_path in safetensor_files:
                 if not remaining_keys:
                     break
+                _issue_shard_readahead(safetensor_file_path)
                 with safe_open(safetensor_file_path, framework="pt", device="cpu") as f:
                     current_file_keys = f.keys()
                     for key in list(remaining_keys):
