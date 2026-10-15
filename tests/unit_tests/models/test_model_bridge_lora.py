@@ -348,6 +348,11 @@ def test_merge_lora_adapter_weights_qkv_split(monkeypatch):
         hidden_size=4,
         attention_output_gate=False,
         num_moe_experts=0,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+        kda_two_stage_gates=False,
     )
     megatron_model = [SimpleNamespace(config=config)]
     converted = {
@@ -374,6 +379,21 @@ def test_merge_lora_adapter_weights_qkv_split(monkeypatch):
     torch.testing.assert_close(updated["q_proj.weight"], q_weight)
     torch.testing.assert_close(updated["k_proj.weight"], k_weight)
     torch.testing.assert_close(updated["v_proj.weight"], v_weight)
+
+
+@pytest.mark.parametrize("trailing_shape", [(), (4,)])
+def test_split_kda_qkv_linear_out_weight(trailing_shape):
+    config = SimpleNamespace(
+        kda_two_stage_gates=True,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+    )
+    sections = [torch.full((4, *trailing_shape), value) for value in (1.0, 2.0, 3.0)]
+    actual = DummyBridge()._split_qkv_linear_out_weight([SimpleNamespace(config=config)], torch.cat(sections))
+    for name, expected in zip(("q_proj", "k_proj", "v_proj"), sections, strict=True):
+        torch.testing.assert_close(actual[name], expected)
 
 
 def test_merge_lora_adapter_weights_grouped_expert_missing_expert_idx(monkeypatch):
@@ -752,6 +772,7 @@ def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
         pp_rank,
         vp_stage,
         is_split_gate_up,
+        is_split_qkv,
     ) = info[0]
     assert global_base_name == "decoder.layers.0.mlp.linear_fc1.adapter"
     assert local_base_prefix == "decoder.layers.0.mlp.linear_fc1"
@@ -761,6 +782,8 @@ def test_megatron_global_adapters_info_all_pp_ranks(monkeypatch):
     # Split gate/up adapters (SplitGateUpAdapter) are flagged so the
     # conversion emits one task per pair; a plain ParallelLinearAdapter is not.
     assert is_split_gate_up is False
+    # Same flag for split q/k/v adapters (SplitQKVAdapter).
+    assert is_split_qkv is False
 
 
 def test_construct_adapters_names():
@@ -817,6 +840,7 @@ def test_build_adapter_conversion_tasks(monkeypatch):
             0,
             0,
             False,
+            False,
         )
     ]
 
@@ -869,6 +893,7 @@ def test_build_adapter_conversion_tasks_excludes_base_prefix_before_mapping(monk
             8,
             0,
             0,
+            False,
             False,
         )
     ]
@@ -2620,8 +2645,8 @@ def test_split_gate_up_adapter_emits_one_task_per_half(monkeypatch):
     4 tasks per fused fc1 and 312 duplicate PEFT names in the mint shard
     document).
     """
-    from megatron.bridge.peft.utils import SplitGateUpAdapter
     from megatron.bridge.models.conversion.peft_bridge import is_split_gate_up_adapter
+    from megatron.bridge.peft.utils import SplitGateUpAdapter
 
     bridge = DummyBridge()
     bridge.hf_pretrained = SimpleNamespace()
@@ -2652,6 +2677,7 @@ def test_split_gate_up_adapter_emits_one_task_per_half(monkeypatch):
             0,
             0,
             True,
+            False,
         ),
         (
             "decoder.layers.0.mlp.linear_fc1.adapter.up",
@@ -2664,6 +2690,7 @@ def test_split_gate_up_adapter_emits_one_task_per_half(monkeypatch):
             0,
             0,
             True,
+            False,
         ),
     ]
 
@@ -2692,6 +2719,1227 @@ def test_split_gate_up_adapter_emits_one_task_per_half(monkeypatch):
     assert by_half["gate"].linear_in_task.param_weight is adapter.linear_in.weight
 
 
+
+
+def test_dequantize_fp8_blockwise_matches_the_ragged_loop():
+    """The vectorized exact-block path must agree bit-for-bit with the
+    reference loop (the ragged path is the same code the fast path replaced).
+    Guards the GLM-5.3-Flash import: 37,338 tensors ride this function, and a
+    silent numeric drift here would move every weight in the model."""
+    import torch
+
+    from megatron.bridge.models.conversion.quantization_utils import (
+        dequantize_fp8_blockwise,
+    )
+
+    torch.manual_seed(0)
+
+    def ragged_reference(weight, scale_inv, block_size=128, dtype=torch.bfloat16):
+        M, N = weight.shape
+        w = weight.float()
+        out = torch.empty_like(w)
+        sM, sN = scale_inv.shape
+        for bi in range(sM):
+            for bj in range(sN):
+                r0, r1 = bi * block_size, min((bi + 1) * block_size, M)
+                c0, c1 = bj * block_size, min((bj + 1) * block_size, N)
+                out[r0:r1, c0:c1] = w[r0:r1, c0:c1] * scale_inv[bi, bj]
+        return out.to(dtype)
+
+    # Exact-block geometry (the checkpoint's): both dims multiples of 128.
+    for (M, N) in [(256, 128), (512, 256), (4096, 2048)]:
+        w = torch.randn(M, N).to(torch.float8_e4m3fn)
+        s = torch.rand(M // 128, N // 128, dtype=torch.float32) * 0.5 + 0.1
+        fast = dequantize_fp8_blockwise(w, s)
+        ref = ragged_reference(w, s)
+        assert fast.shape == ref.shape
+        assert torch.equal(fast, ref), f"fast path diverged at {(M, N)}"
+
+    # Ragged geometry must still work (loop path).
+    w = torch.randn(300, 200).to(torch.float8_e4m3fn)
+    s = torch.rand(3, 2, dtype=torch.float32) * 0.5 + 0.1
+    out = dequantize_fp8_blockwise(w, s)
+    assert out.shape == (300, 200)
+    assert torch.equal(out, ragged_reference(w, s))
+
+
+def test_shard_readahead_is_best_effort(tmp_path):
+    """The readahead helper must never break a load: a missing file, a
+    directory, or a platform without posix_fadvise all fall through silently.
+    The win it buys on the real mount is 4.5-7.6x on cold shards (measured),
+    and the load must not trade that for a new failure mode."""
+    from megatron.bridge.models.hf_pretrained import state as state_mod
+
+    # A real file: call must succeed and leave the file readable.
+    f = tmp_path / "shard.safetensors"
+    f.write_bytes(b"\0" * 4096)
+    state_mod._issue_shard_readahead(f)
+    assert f.read_bytes() == b"\0" * 4096
+
+    # Missing path and a directory: silent no-ops, no exception.
+    state_mod._issue_shard_readahead(tmp_path / "nope.safetensors")
+    state_mod._issue_shard_readahead(tmp_path)
+
+    # Platform without fadvise: monkeypatch it away and confirm the helper
+    # still swallows the AttributeError.
+    import os
+
+    had = hasattr(os, "posix_fadvise")
+    if had:
+        orig = os.posix_fadvise
+        del os.posix_fadvise
+        try:
+            state_mod._issue_shard_readahead(f)
+        finally:
+            os.posix_fadvise = orig
+
+def _cpu_mp_config(tp_size: int = 1):
+    """Model-parallel config that keeps adapter construction off the GPU.
+
+    The unit suite also runs on CPU-only hosts, where MCore's column-parallel
+    linears would otherwise call ``torch.cuda.current_device()``. Asking for CPU
+    initialization keeps the same code path on both host kinds.
+    """
+    from megatron.core import ModelParallelConfig
+
+    return ModelParallelConfig(
+        use_cpu_initialization=True,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=False,
+        params_dtype=torch.float32,
+    )
+
+
+def _build_split_qkv_adapter(
+    heads: int,
+    groups,
+    head_size,
+    *,
+    fused_out: int,
+    in_features: int = 64,
+    dim: int = 8,
+    tp_size: int = 1,
+):
+    """Build a real SplitQKVAdapter for a fused linear_qkv of ``fused_out`` rows.
+
+    Adapter construction must not depend on an initialized Megatron MPU
+    (``ProcessGroupCollection.use_mpu_process_groups`` reads distributed state a
+    unit test does not set up), so a collection whose process groups are all
+    None is injected; the adapters then behave as unsharded (``tp_size == 1``).
+    """
+    from unittest.mock import patch
+
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    from megatron.bridge.peft.utils import SplitQKVAdapter
+
+    # A real collection object with every field left at its None default: the
+    # adapter then reaches for no process group at all.
+    stub = ProcessGroupCollection()
+    with patch.object(ProcessGroupCollection, "use_mpu_process_groups", classmethod(lambda cls, **kwargs: stub)):
+        return SplitQKVAdapter(
+            in_features,
+            fused_out,
+            dim,
+            qkv_head_layout=(heads, groups, head_size),
+            base_linear_name="decoder.layers.0.self_attn.linear_qkv",
+            activation="identity",
+            model_parallel_config=_cpu_mp_config(tp_size),
+            input_is_parallel=False,
+            base_linear_is_parallel=True,
+        )
+
+
+def test_split_qkv_adapter_builds_three_independent_pairs():
+    """GQA case: q = heads * head_size, k = v = groups * head_size, three pairs."""
+    adapter = _build_split_qkv_adapter(8, 4, 64, fused_out=(8 + 2 * 4) * 64)
+
+    assert adapter._qkv_head_layout == (8, 4, 64)
+    assert adapter.linear_out.weight.shape[0] == 512  # q face = heads * head_size
+    assert adapter.k.linear_out.weight.shape[0] == 256  # k face = groups * head_size
+    assert adapter.v.linear_out.weight.shape[0] == 256
+    # One shared rank-dim projection per face, each seeing every input feature.
+    assert adapter.linear_in.weight.shape == (8, 64)
+    assert adapter.k.linear_in.weight.shape == (8, 64)
+    assert adapter.v.linear_in.weight.shape == (8, 64)
+
+    pairs = adapter.pairs()
+    assert len(pairs) == 3
+    (q_in, q_out), (k_in, k_out), (v_in, v_out) = pairs
+    assert q_in is adapter.linear_in and q_out is adapter.linear_out
+    assert k_in is adapter.k.linear_in and k_out is adapter.k.linear_out
+    assert v_in is adapter.v.linear_in and v_out is adapter.v.linear_out
+    # Three pairs must not alias: six distinct modules.
+    assert len({id(module) for pair in pairs for module in pair}) == 6
+
+
+def test_split_qkv_adapter_full_mha_and_inferred_head_size():
+    """``num_query_groups=None`` means full MHA; ``kv_channels=None`` infers head_size."""
+    mha = _build_split_qkv_adapter(8, None, 64, fused_out=(8 + 2 * 8) * 64)
+    assert mha._qkv_head_layout == (8, 8, 64)
+    assert mha.linear_out.weight.shape[0] == 512
+    assert mha.k.linear_out.weight.shape[0] == 512
+
+    # No kv_channels: head_size is recovered from the fused output dim.
+    inferred = _build_split_qkv_adapter(8, 4, None, fused_out=(8 + 2 * 4) * 64)
+    assert inferred._qkv_head_layout == (8, 4, 64)
+    assert inferred.k.linear_out.weight.shape[0] == 256
+
+
+def test_split_qkv_adapter_rejects_inconsistent_layout():
+    """A layout whose face sizes do not reproduce the fused dim must fail loudly."""
+    from megatron.bridge.peft.utils import SplitQKVAdapter
+
+    # Full MHA needs (8 + 2 * 8) * 64 = 1536 rows, not 1024.
+    with pytest.raises(ValueError, match="match neither"):
+        _build_split_qkv_adapter(8, 8, 64, fused_out=1024)
+    # num_attention_heads must be divisible by num_query_groups.
+    with pytest.raises(ValueError, match="divisible by num_query_groups"):
+        _build_split_qkv_adapter(8, 3, 64, fused_out=(8 + 2 * 3) * 64)
+    # The layout is mandatory: the faces cannot be derived without it.
+    with pytest.raises(ValueError, match="qkv_head_layout"):
+        SplitQKVAdapter(
+            64,
+            1024,
+            8,
+            base_linear_name="decoder.layers.0.self_attn.linear_qkv",
+            activation="identity",
+            model_parallel_config=_cpu_mp_config(),
+            input_is_parallel=False,
+            base_linear_is_parallel=True,
+        )
+
+
+def test_split_qkv_adapter_interleave_matches_faces_and_row_indices_invert_it():
+    """The packed output must be the per-group [q_heads; k; v] layout, invertible."""
+    heads, groups, head_size = 8, 4, 64
+    heads_per_group = heads // groups
+    adapter = _build_split_qkv_adapter(heads, groups, head_size, fused_out=(heads + 2 * groups) * head_size)
+    x = torch.randn(2, 3, 64)
+
+    def face_delta(pair):
+        hidden, _ = pair.linear_in(x)
+        out, _ = pair.linear_out(pair.activation(hidden))
+        return out * (pair.alpha / pair.dim)
+
+    q_delta = face_delta(adapter)
+    k_delta = face_delta(adapter.k)
+    v_delta = face_delta(adapter.v)
+    assert q_delta.shape[-1] == 512 and k_delta.shape[-1] == 256
+
+    fused = adapter._interleave_qkv(q_delta, k_delta, v_delta)
+
+    # Independent reference: slice each face by explicit per-group index math.
+    chunks = []
+    for group in range(groups):
+        q_start = group * heads_per_group * head_size
+        chunks.append(q_delta[..., q_start : q_start + heads_per_group * head_size])
+        chunks.append(k_delta[..., group * head_size : (group + 1) * head_size])
+        chunks.append(v_delta[..., group * head_size : (group + 1) * head_size])
+    torch.testing.assert_close(fused, torch.cat(chunks, dim=-1))
+
+    # The row indices must recover the faces from the packed tensor, and cover it.
+    q_idx, k_idx, v_idx = adapter.face_row_indices(heads_per_group, head_size, groups)
+    assert sorted(q_idx + k_idx + v_idx) == list(range(fused.shape[-1]))
+    torch.testing.assert_close(fused[..., torch.as_tensor(q_idx)], q_delta)
+    torch.testing.assert_close(fused[..., torch.as_tensor(k_idx)], k_delta)
+    torch.testing.assert_close(fused[..., torch.as_tensor(v_idx)], v_delta)
+
+
+def test_split_qkv_adapter_interleave_rejects_tensor_shapes_off_the_layout():
+    """A per-rank tensor whose head/group ratio disagrees with the layout must fail."""
+    adapter = _build_split_qkv_adapter(8, 4, 64, fused_out=1024)
+    with pytest.raises(ValueError, match="not divisible by head_size"):
+        adapter._interleave_qkv(torch.zeros(1, 1, 500), torch.zeros(1, 1, 256), torch.zeros(1, 1, 256))
+    with pytest.raises(ValueError, match="disagree on the local query-group count"):
+        adapter._interleave_qkv(torch.zeros(1, 1, 512), torch.zeros(1, 1, 256), torch.zeros(1, 1, 128))
+
+
+def test_split_qkv_adapter_forward_packs_the_three_pairs(monkeypatch):
+    """forward must call all three pairs and hand their deltas to the packer."""
+    from megatron.bridge.peft.utils import ParallelLinearAdapter
+
+    adapter = _build_split_qkv_adapter(8, 4, 64, fused_out=1024)
+    q_delta = torch.full((1, 1, 512), 1.0)
+    k_delta = torch.full((1, 1, 256), 2.0)
+    v_delta = torch.full((1, 1, 256), 3.0)
+    deltas = {id(adapter): q_delta, id(adapter.k): k_delta, id(adapter.v): v_delta}
+
+    monkeypatch.setattr(ParallelLinearAdapter, "forward", lambda self, x, *args, **kwargs: deltas[id(self)])
+
+    out = adapter.forward(torch.zeros(1, 1, 64))
+    torch.testing.assert_close(out, adapter._interleave_qkv(q_delta, k_delta, v_delta))
+
+
+def test_split_qkv_adapter_merged_weight_merges_each_face_into_its_own_rows():
+    """base + interleaved per-face deltas, with every fused row written exactly once."""
+    heads, groups, head_size = 8, 4, 64
+    heads_per_group = heads // groups
+    adapter = _build_split_qkv_adapter(heads, groups, head_size, fused_out=(heads + 2 * groups) * head_size)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        # row_init_method defaults to "zero", so randomize B to get a non-trivial delta.
+        for pair in (adapter, adapter.k, adapter.v):
+            pair.linear_out.weight.normal_()
+
+    base = torch.randn((heads + 2 * groups) * head_size, 64)
+    merged = adapter.merged_weight(base)
+    assert merged.shape == base.shape
+    assert not torch.allclose(merged, base), "merge must actually change the fused weight"
+
+    q_idx, k_idx, v_idx = adapter.face_row_indices(heads_per_group, head_size, groups)
+    expected = base.clone()
+    for pair, indices in ((adapter, q_idx), (adapter.k, k_idx), (adapter.v, v_idx)):
+        index = torch.as_tensor(indices)
+        delta = (pair.alpha / pair.dim) * (pair.linear_out.weight @ pair.linear_in.weight)
+        expected.index_copy_(0, index, torch.index_select(base, 0, index) + delta)
+    torch.testing.assert_close(merged, expected)
+
+
+def test_split_qkv_adapter_merged_weight_handles_a_tp_shard():
+    """A per-rank fused shard carries fewer query groups; the merge must still line up."""
+    heads, groups, head_size = 8, 4, 64
+    heads_per_group = heads // groups
+    adapter = _build_split_qkv_adapter(heads, groups, head_size, fused_out=(heads + 2 * groups) * head_size)
+    torch.manual_seed(1)
+    with torch.no_grad():
+        for pair in (adapter, adapter.k, adapter.v):
+            pair.linear_out.weight.normal_()
+
+    # tp = 2: this rank holds the first two of the four query groups, so each
+    # face carries only its rank slice of rows (q: heads/2 * head_size, k/v:
+    # groups/2 * head_size) and the fused base only 2 * rows_per_group rows.
+    local_groups = 2
+    local_rows = (heads_per_group + 2) * head_size * local_groups
+    base = torch.randn(local_rows, 64)
+    with torch.no_grad():
+        for pair, rank_rows in ((adapter, 256), (adapter.k, 128), (adapter.v, 128)):
+            pair.linear_out.weight = torch.nn.Parameter(pair.linear_out.weight[:rank_rows].clone())
+
+    merged = adapter.merged_weight(base)
+    assert merged.shape == base.shape
+
+    q_idx, k_idx, v_idx = adapter.face_row_indices(heads_per_group, head_size, local_groups)
+    assert max(q_idx + k_idx + v_idx) == local_rows - 1
+    expected = base.clone()
+    for pair, indices in ((adapter, q_idx), (adapter.k, k_idx), (adapter.v, v_idx)):
+        index = torch.as_tensor(indices)
+        delta = (pair.alpha / pair.dim) * (pair.linear_out.weight @ pair.linear_in.weight)
+        expected.index_copy_(0, index, torch.index_select(base, 0, index) + delta)
+    torch.testing.assert_close(merged, expected)
+
+
+def test_split_qkv_adapter_merged_weight_rejects_a_non_group_multiple():
+    """A fused weight that is not a whole number of query groups cannot be split."""
+    adapter = _build_split_qkv_adapter(8, 4, 64, fused_out=1024)
+    with pytest.raises(ValueError, match="one query group's rows"):
+        adapter.merged_weight(torch.randn(1000, 64))
+
+
+def _split_qkv_adapters_info(base: str, include_face_suffix: bool = True):
+    """Three enumeration entries, exactly as named_parameters yields them."""
+    info = [(f"{base}.adapter", base, False, False, False, 32, 8, 0, 0, False, True)]
+    if include_face_suffix:
+        for face in ("k", "v"):
+            info.append((f"{base}.adapter.{face}", base, False, False, False, 32, 8, 0, 0, False, True))
+    return info
+
+
+def _fake_split_qkv_adapter():
+    from megatron.bridge.peft.utils import SplitQKVAdapter
+
+    adapter = SplitQKVAdapter.__new__(SplitQKVAdapter)
+    torch.nn.Module.__init__(adapter)
+
+    def _holder():
+        return SimpleNamespace(weight=torch.ones(2, 2))
+
+    adapter.linear_in, adapter.linear_out = _holder(), _holder()
+    adapter.k = SimpleNamespace(linear_in=_holder(), linear_out=_holder())
+    adapter.v = SimpleNamespace(linear_in=_holder(), linear_out=_holder())
+    adapter.alpha, adapter.dim = 32, 8
+    return adapter
+
+
+def _qkv_registry():
+    from megatron.bridge.models.conversion.param_mapping import QKVMapping
+
+    return MegatronMappingRegistry(
+        QKVMapping(
+            megatron_param="decoder.layers.*.self_attention.linear_qkv.weight",
+            q="model.layers.*.self_attn.q_proj.weight",
+            k="model.layers.*.self_attn.k_proj.weight",
+            v="model.layers.*.self_attn.v_proj.weight",
+        )
+    )
+
+
+def test_split_qkv_adapter_emits_one_task_per_face(monkeypatch):
+    """Three enumerated pairs must yield three tasks, each owning one face.
+
+    Emitting all three faces per entry would triple every split surface, the
+    q/k/v analogue of the doubled gate/up surface the split-gate-up test pins.
+    """
+    from megatron.bridge.models.conversion.peft_bridge import is_split_qkv_adapter
+
+    bridge = DummyBridge()
+    bridge.hf_pretrained = SimpleNamespace()
+    bridge.hf_config = bridge.hf_pretrained
+
+    adapter = _fake_split_qkv_adapter()
+    assert is_split_qkv_adapter(adapter), "predicate must see the real class"
+
+    base = "decoder.layers.0.self_attention.linear_qkv"
+    adapters_info = _split_qkv_adapters_info(base)
+    monkeypatch.setattr(bridge, "_megatron_global_adapters_info_all_pp_ranks", lambda *_: adapters_info)
+    monkeypatch.setattr(bridge, "_get_adapter_wrap_module", lambda *_: (adapter, None))
+    monkeypatch.setattr(
+        "megatron.bridge.models.conversion.model_bridge.parallel_state.get_pipeline_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(bridge, "mapping_registry", _qkv_registry)
+
+    tasks_by_base = bridge.build_adapter_conversion_tasks([Mock()])
+    assert list(tasks_by_base) == [base]
+    tasks = tasks_by_base[base]
+    assert len(tasks) == 3, "one task per face (not per face per entry)"
+    by_face = {task.qkv_face: task for task in tasks}
+    assert sorted(by_face) == ["k", "q", "v"]
+    # Each task carries its OWN pair, not the q pair three times.
+    assert by_face["q"].linear_in_task.param_weight is adapter.linear_in.weight
+    assert by_face["k"].linear_in_task.param_weight is adapter.k.linear_in.weight
+    assert by_face["v"].linear_out_task.param_weight is adapter.v.linear_out.weight
+    # The q pair's names stay plain; k / v are tagged with their face.
+    assert by_face["q"].linear_in_task.global_param_name.endswith(".adapter.linear_in.weight")
+    assert by_face["k"].linear_in_task.global_param_name.endswith(".adapter.linear_in.weight.k")
+    assert by_face["v"].linear_in_task.global_param_name.endswith(".adapter.linear_in.weight.v")
+
+
+def test_stream_adapter_weights_megatron_to_hf_split_qkv_faces(monkeypatch):
+    """Each face streams under its own HF name with its own tensor.
+
+    The registry maps the fused ``linear_qkv`` base to all three q/k/v names at
+    once, so the face is what selects the HF base. The fused contiguous slicing
+    path must NOT run: a split adapter stores each face separately, so slicing
+    the (already per-face) tensor again would emit a fraction of a face.
+    """
+    bridge = DummyBridge()
+    bridge.hf_pretrained = SimpleNamespace()
+    bridge.hf_config = bridge.hf_pretrained
+
+    base = "decoder.layers.0.self_attention.linear_qkv"
+    face_tensors = {
+        "q": torch.full((2, 2), 1.0),
+        "k": torch.full((2, 2), 2.0),
+        "v": torch.full((2, 2), 3.0),
+    }
+
+    def _task(face: str) -> AdapterWeightConversionTask:
+        tag = "" if face == "q" else f".{face}"
+        return AdapterWeightConversionTask(
+            global_base_prefix=base,
+            adapter_key=None,
+            alpha=2,
+            dim=4,
+            linear_in_task=WeightConversionTask(
+                param_name="local_in",
+                global_param_name=f"{base}.adapter.linear_in.weight{tag}",
+                mapping=Mock(),
+            ),
+            linear_out_task=WeightConversionTask(
+                param_name="local_out",
+                global_param_name=f"{base}.adapter.linear_out.weight{tag}",
+                mapping=Mock(),
+            ),
+            qkv_face=face,
+        )
+
+    monkeypatch.setattr(
+        bridge,
+        "build_adapter_conversion_tasks",
+        lambda *_args, **_kwargs: {base: [_task("q"), _task("k"), _task("v")]},
+    )
+    monkeypatch.setattr(
+        bridge,
+        "materialize_adapter_weights",
+        lambda tasks: [
+            AdapterWeight(
+                global_base_prefix=base,
+                adapter_key=None,
+                alpha=2,
+                dim=4,
+                linear_in_weight=MegatronWeightTuple("local_in", torch.ones(2, 2), vp_stage=0),
+                linear_out_weight=MegatronWeightTuple(
+                    "local_out", face_tensors[tasks[0].qkv_face], vp_stage=0
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_get_base_hf_param_names_for_adapter",
+        lambda *_: [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+        ],
+    )
+
+    def _no_fused_slicing(*_args, **_kwargs):
+        raise AssertionError("split q/k/v faces must not go through the fused slicing path")
+
+    monkeypatch.setattr(bridge, "_get_fused_adapter_linear_out_slices", _no_fused_slicing)
+
+    weights = list(
+        bridge.stream_adapter_weights_megatron_to_hf(
+            [SimpleNamespace(config=SimpleNamespace(num_moe_experts=0))],
+            cpu=False,
+            show_progress=False,
+        )
+    )
+
+    assert len(weights) == 6, "two tensors (A and B) per face, no duplicates"
+    names = [w.param_name for w in weights]
+    assert names == [
+        "model.layers.0.self_attn.q_proj.lora_A.weight",
+        "model.layers.0.self_attn.q_proj.lora_B.weight",
+        "model.layers.0.self_attn.k_proj.lora_A.weight",
+        "model.layers.0.self_attn.k_proj.lora_B.weight",
+        "model.layers.0.self_attn.v_proj.lora_A.weight",
+        "model.layers.0.self_attn.v_proj.lora_B.weight",
+    ]
+    # Each face's B tensor is emitted as-is, unmixed with the other faces.
+    torch.testing.assert_close(weights[1].weight, face_tensors["q"])
+    torch.testing.assert_close(weights[3].weight, face_tensors["k"])
+    torch.testing.assert_close(weights[5].weight, face_tensors["v"])
+
+
+def test_stream_adapter_weights_megatron_to_hf_split_qkv_rejects_missing_face(monkeypatch):
+    """A registry that exposes no per-face HF base for the fused qkv must fail loudly."""
+    bridge = DummyBridge()
+    bridge.hf_pretrained = SimpleNamespace()
+    bridge.hf_config = bridge.hf_pretrained
+
+    base = "decoder.layers.0.self_attention.linear_qkv"
+    task = AdapterWeightConversionTask(
+        global_base_prefix=base,
+        adapter_key=None,
+        alpha=2,
+        dim=4,
+        linear_in_task=WeightConversionTask(param_name="local_in", global_param_name="g_in", mapping=Mock()),
+        linear_out_task=WeightConversionTask(param_name="local_out", global_param_name="g_out", mapping=Mock()),
+        qkv_face="k",
+    )
+    monkeypatch.setattr(
+        bridge, "build_adapter_conversion_tasks", lambda *_a, **_k: {base: [task]}
+    )
+    monkeypatch.setattr(
+        bridge,
+        "materialize_adapter_weights",
+        lambda *_a, **_k: [
+            AdapterWeight(
+                global_base_prefix=base,
+                adapter_key=None,
+                alpha=2,
+                dim=4,
+                linear_in_weight=MegatronWeightTuple("local_in", torch.ones(2, 2), vp_stage=0),
+                linear_out_weight=MegatronWeightTuple("local_out", torch.ones(2, 2), vp_stage=0),
+            )
+        ],
+    )
+    # Fused single-name mapping: no ``.k_proj.`` base to attach the face to.
+    monkeypatch.setattr(
+        bridge, "_get_base_hf_param_names_for_adapter", lambda *_: ["model.layers.0.self_attn.query.weight"]
+    )
+
+    with pytest.raises(ValueError, match="expected exactly one k_proj base"):
+        list(
+            bridge.stream_adapter_weights_megatron_to_hf(
+                [SimpleNamespace(config=SimpleNamespace(num_moe_experts=0))],
+                cpu=False,
+                show_progress=False,
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Blocked (GDN / KDA ``in_proj``) split q/k/v mode
+#
+# The GDN / gated-delta-net linear-attention mixer fuses q, k and v into one
+# ``in_proj`` whose output is the BLOCK concatenation ``[q (qk); k (qk); v (v);
+# extra]`` — no per-query-group packing — and the reference platform carries the
+# same three ``q_proj`` / ``k_proj`` / ``v_proj`` faces on it. The blocks that
+# follow v (``z`` / ``f`` / ``b`` / ``w`` ... by variant) are not platform
+# targets, so their delta must be exactly zero.
+# ---------------------------------------------------------------------------
+
+
+def _build_blocked_split_qkv_adapter(
+    qk_dim: int,
+    v_dim: int,
+    extra: int,
+    *,
+    in_features: int = 64,
+    dim: int = 8,
+    tp_size: int = 1,
+    fused_out: int | None = None,
+):
+    """Build a real SplitQKVAdapter in blocked mode (GDN ``in_proj`` layout)."""
+    from unittest.mock import patch
+
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    from megatron.bridge.peft.utils import SplitQKVAdapter
+
+    # Same ProcessGroupCollection stub as _build_split_qkv_adapter: adapter
+    # construction must not need an initialized Megatron MPU.
+    stub = ProcessGroupCollection()
+    with patch.object(ProcessGroupCollection, "use_mpu_process_groups", classmethod(lambda cls, **kwargs: stub)):
+        return SplitQKVAdapter(
+            in_features,
+            fused_out if fused_out is not None else 2 * qk_dim + v_dim + extra,
+            dim,
+            qkv_block_layout=(qk_dim, v_dim, extra),
+            base_linear_name="decoder.layers.0.inner_layer.self_attention.in_proj",
+            activation="identity",
+            model_parallel_config=_cpu_mp_config(tp_size),
+            input_is_parallel=False,
+            base_linear_is_parallel=True,
+        )
+
+
+def test_split_qkv_adapter_blocked_builds_contiguous_face_blocks():
+    """q = k = qk_dim and v = v_dim on one contiguous block each; extra rows own nothing."""
+    adapter = _build_blocked_split_qkv_adapter(6, 4, 2)
+
+    assert adapter._qkv_layout_mode == "blocked"
+    assert adapter._qkv_block_layout == (6, 4, 2)
+    # The interleaved geometry is not derivable (and is not used) in this mode.
+    assert adapter._qkv_head_layout is None
+
+    assert adapter.linear_out.weight.shape[0] == 6  # q block
+    assert adapter.k.linear_out.weight.shape[0] == 6  # k block
+    assert adapter.v.linear_out.weight.shape[0] == 4  # v block
+    assert adapter.linear_in.weight.shape == (8, 64)
+
+    pairs = adapter.pairs()
+    assert len(pairs) == 3
+    (q_in, q_out), (k_in, k_out), (v_in, v_out) = pairs
+    assert q_in is adapter.linear_in and q_out is adapter.linear_out
+    assert k_in is adapter.k.linear_in and k_out is adapter.k.linear_out
+    assert v_in is adapter.v.linear_in and v_out is adapter.v.linear_out
+    assert len({id(module) for pair in pairs for module in pair}) == 6
+
+
+def test_split_qkv_adapter_blocked_accepts_the_per_rank_fused_width():
+    """The fused width is accepted GLOBAL (18) or per-rank (18 / tp = 9 for tp = 2)."""
+    global_adapter = _build_blocked_split_qkv_adapter(6, 4, 2)
+    assert global_adapter._qkv_block_layout == (6, 4, 2)
+
+    per_rank = _build_blocked_split_qkv_adapter(6, 4, 2, tp_size=2, fused_out=9)
+    assert per_rank._qkv_block_layout == (6, 4, 2)
+    assert per_rank._qkv_tp_size == 2
+    # The stored geometry stays GLOBAL; only the merge/index derivation shards it.
+    assert per_rank._blocked_local_sizes(18) == (6, 4, 2)
+    assert per_rank._blocked_local_sizes(9) == (3, 2, 1)
+
+
+def test_split_qkv_adapter_rejects_conflicting_or_missing_layout_modes():
+    """Exactly one layout kwarg is required, and neither may be inferred."""
+    from unittest.mock import patch
+
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    from megatron.bridge.peft.utils import SplitQKVAdapter
+
+    stub = ProcessGroupCollection()
+    common = dict(
+        base_linear_name="decoder.layers.0.inner_layer.self_attention.in_proj",
+        activation="identity",
+        model_parallel_config=_cpu_mp_config(),
+        input_is_parallel=False,
+        base_linear_is_parallel=True,
+    )
+    with patch.object(ProcessGroupCollection, "use_mpu_process_groups", classmethod(lambda cls, **kwargs: stub)):
+        with pytest.raises(ValueError, match="not both"):
+            SplitQKVAdapter(64, 18, 8, qkv_head_layout=(8, 4, 64), qkv_block_layout=(6, 4, 2), **common)
+        with pytest.raises(ValueError, match="requires either qkv_head_layout"):
+            SplitQKVAdapter(64, 18, 8, **common)
+
+
+def test_split_qkv_adapter_blocked_rejects_fused_widths_off_the_layout():
+    """A fused width that does not reproduce 2 * qk + v + extra must fail loudly."""
+    with pytest.raises(ValueError, match="matches neither out_features"):
+        _build_blocked_split_qkv_adapter(6, 4, 2, fused_out=17)
+    with pytest.raises(ValueError, match="must be positive"):
+        _build_blocked_split_qkv_adapter(0, 4, 2)
+    with pytest.raises(ValueError, match="extra_features_dim must be >= 0"):
+        _build_blocked_split_qkv_adapter(6, 4, -1, fused_out=16)
+    # Every face shards independently, so each block must divide by tp_size.
+    with pytest.raises(ValueError, match="must be divisible by"):
+        _build_blocked_split_qkv_adapter(6, 4, 3, tp_size=2, fused_out=19)
+
+
+def test_split_qkv_adapter_blocked_forward_cats_a_zero_extra_block(monkeypatch):
+    """forward = cat([q, k, v, zeros(extra)]); the interleaver must NOT run."""
+    from megatron.bridge.peft.utils import ParallelLinearAdapter
+
+    adapter = _build_blocked_split_qkv_adapter(6, 4, 2)
+    q_delta = torch.full((2, 3, 6), 1.0)
+    k_delta = torch.full((2, 3, 6), 2.0)
+    v_delta = torch.full((2, 3, 4), 3.0)
+    deltas = {id(adapter): q_delta, id(adapter.k): k_delta, id(adapter.v): v_delta}
+    monkeypatch.setattr(ParallelLinearAdapter, "forward", lambda self, x, *args, **kwargs: deltas[id(self)])
+    monkeypatch.setattr(
+        adapter,
+        "_interleave_qkv",
+        lambda *_: pytest.fail("blocked mode must not interleave"),
+    )
+
+    out = adapter.forward(torch.zeros(2, 3, 64))
+
+    assert out.shape == (2, 3, 18)
+    torch.testing.assert_close(out[..., :6], q_delta)
+    torch.testing.assert_close(out[..., 6:12], k_delta)
+    torch.testing.assert_close(out[..., 12:16], v_delta)
+    # The non-target rows must be present (the fused output is added wholesale)
+    # and carry no adapter contribution.
+    extra = out[..., 16:]
+    assert extra.shape == (2, 3, 2)
+    assert torch.count_nonzero(extra) == 0
+
+
+def test_split_qkv_adapter_blocked_forward_without_extra_rows(monkeypatch):
+    """extra == 0 emits the plain three-block concatenation."""
+    from megatron.bridge.peft.utils import ParallelLinearAdapter
+
+    adapter = _build_blocked_split_qkv_adapter(6, 4, 0)
+    deltas = {
+        id(adapter): torch.full((1, 6), 1.0),
+        id(adapter.k): torch.full((1, 6), 2.0),
+        id(adapter.v): torch.full((1, 4), 3.0),
+    }
+    monkeypatch.setattr(ParallelLinearAdapter, "forward", lambda self, x, *args, **kwargs: deltas[id(self)])
+
+    out = adapter.forward(torch.zeros(1, 64))
+    assert out.shape == (1, 16)
+    torch.testing.assert_close(out, torch.cat([deltas[id(adapter)], deltas[id(adapter.k)], deltas[id(adapter.v)]], -1))
+
+
+def test_split_qkv_adapter_blocked_face_row_indices_are_contiguous():
+    """Each face's rows are one contiguous range; the extra rows belong to no face."""
+    adapter = _build_blocked_split_qkv_adapter(6, 4, 2)
+
+    q_idx, k_idx, v_idx = adapter.face_row_indices_for_layout(18)
+    assert q_idx == list(range(0, 6))
+    assert k_idx == list(range(6, 12))
+    assert v_idx == list(range(12, 16))
+    # The extra block is deliberately uncovered: nothing merges into it.
+    assert sorted(q_idx + k_idx + v_idx) == list(range(16))
+
+    # Per-rank (tp = 2): the shard keeps the first half of every block, so the
+    # trailing local extra row is the one that passes through untouched.
+    sharded = _build_blocked_split_qkv_adapter(6, 4, 2, tp_size=2, fused_out=9)
+    q_idx, k_idx, v_idx = sharded.face_row_indices_for_layout(9)
+    assert (q_idx, k_idx, v_idx) == ([0, 1, 2], [3, 4, 5], [6, 7])
+
+
+def test_split_qkv_adapter_blocked_merged_weight_merges_contiguous_slices():
+    """base + per-block deltas; the extra rows pass through unchanged."""
+    adapter = _build_blocked_split_qkv_adapter(6, 4, 2)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        # row_init_method defaults to "zero", so randomize B for a non-trivial delta.
+        for pair in (adapter, adapter.k, adapter.v):
+            pair.linear_out.weight.normal_()
+
+    base = torch.randn(18, 64)
+    merged = adapter.merged_weight(base)
+    assert merged.shape == base.shape
+    assert not torch.allclose(merged, base), "merge must actually change the fused weight"
+
+    expected = base.clone()
+    for pair, (start, width) in ((adapter, (0, 6)), (adapter.k, (6, 6)), (adapter.v, (12, 4))):
+        delta = (pair.alpha / pair.dim) * (pair.linear_out.weight @ pair.linear_in.weight)
+        expected[start : start + width] = base[start : start + width] + delta
+    torch.testing.assert_close(merged, expected)
+    # Untouched extra rows carry no adapter contribution at all.
+    torch.testing.assert_close(merged[16:], base[16:])
+
+    # A fused width that is neither the global total nor its shard cannot be split.
+    with pytest.raises(ValueError, match="match neither the blocked fused width"):
+        adapter.merged_weight(torch.randn(15, 64))
+
+
+def test_split_qkv_adapter_blocked_merged_weight_handles_a_tp_shard():
+    """A per-rank shard carries half of every block; the merge must still line up."""
+    adapter = _build_blocked_split_qkv_adapter(6, 4, 2, tp_size=2, fused_out=9)
+    torch.manual_seed(1)
+    with torch.no_grad():
+        # This rank's slice of each block: q/k 3 rows, v 2 rows, and the extra
+        # block's single local row.
+        for pair, rank_rows in ((adapter, 3), (adapter.k, 3), (adapter.v, 2)):
+            pair.linear_out.weight = torch.nn.Parameter(pair.linear_out.weight[:rank_rows].clone())
+            pair.linear_out.weight.normal_()
+
+    base = torch.randn(9, 64)
+    merged = adapter.merged_weight(base)
+    assert merged.shape == base.shape
+
+    q_idx, k_idx, v_idx = adapter.face_row_indices_for_layout(9)
+    assert max(q_idx + k_idx + v_idx) == 7
+    expected = base.clone()
+    for pair, indices in ((adapter, q_idx), (adapter.k, k_idx), (adapter.v, v_idx)):
+        index = torch.as_tensor(indices)
+        delta = (pair.alpha / pair.dim) * (pair.linear_out.weight @ pair.linear_in.weight)
+        expected.index_copy_(0, index, torch.index_select(base, 0, index) + delta)
+    torch.testing.assert_close(merged, expected)
+    torch.testing.assert_close(merged[8:], base[8:])
+
+
+# ---------------------------------------------------------------------------
+# GDN geometry derivation and the LoRA walk gate
+# ---------------------------------------------------------------------------
+
+
+def _gdn_config(**overrides):
+    """A real TransformerConfig carrying the GLM-5.3-Flash-style GDN head geometry."""
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+        linear_num_key_heads=4,
+        linear_key_head_dim=8,
+        linear_num_value_heads=4,
+        linear_value_head_dim=8,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+def test_gdn_in_proj_block_layout_reads_the_config_geometry():
+    """qk = key_heads * key_head_dim, v = value_heads * value_head_dim, extra = the rest."""
+    from megatron.bridge.peft.lora import gdn_in_proj_block_layout
+
+    # qk = v = 32, so the q/k/v blocks take 96 rows and the rest is extra.
+    assert gdn_in_proj_block_layout(_gdn_config(), 96) == (32, 32, 0)
+    assert gdn_in_proj_block_layout(_gdn_config(), 112) == (32, 32, 16)
+    # The mixer's own shorter spellings are accepted too.
+    short = SimpleNamespace(
+        num_key_heads=4, key_head_dim=8, num_value_heads=4, value_head_dim=8
+    )
+    assert gdn_in_proj_block_layout(short, 112) == (32, 32, 16)
+    # Dual reading: the same geometry fits the per-rank width of a tp = 2 shard.
+    assert gdn_in_proj_block_layout(_gdn_config(tensor_model_parallel_size=2), 56, tp_size=2) == (
+        32,
+        32,
+        16,
+    )
+
+
+def test_gdn_in_proj_block_layout_is_none_without_gdn_geometry():
+    """A config with no GDN head config must not select the split adapter."""
+    from megatron.bridge.peft.lora import gdn_in_proj_block_layout
+
+    assert gdn_in_proj_block_layout(SimpleNamespace(), 112) is None
+    assert (
+        gdn_in_proj_block_layout(
+            SimpleNamespace(linear_num_key_heads=4, linear_key_head_dim=8), 112
+        )
+        is None
+    )
+
+
+def test_gdn_in_proj_block_layout_rejects_a_width_below_the_qkv_blocks():
+    """A GDN config whose fused width cannot hold q/k/v is a real mismatch, not a skip."""
+    from megatron.bridge.peft.lora import gdn_in_proj_block_layout
+
+    with pytest.raises(ValueError, match="does not fit the fused"):
+        gdn_in_proj_block_layout(_gdn_config(), 40)
+
+
+def _walk_with_gdn_config(
+    module_name: str, module, config, prefix: str, *, dim: int = 4, split: bool = True
+):
+    """Run LoRA.transform on ``module`` with the TE-stub workarounds the CPU host needs.
+
+    ``transformer_engine`` is stubbed on this host, so
+    ``megatron.bridge.peft.utils.HAVE_TE`` is True while its ``TECL``/``TERL``
+    tuples hold MagicMocks — ``isinstance()`` against them raises ``TypeError``.
+    Forcing the flag off takes the real MCore ``ColumnParallelLinear`` /
+    ``RowParallelLinear`` branch instead, which is the branch these modules use
+    on a real host anyway (the TE wrappers subclass them).
+    """
+    from unittest.mock import patch
+
+    from megatron.core import parallel_state
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    import megatron.bridge.peft.utils as peft_utils
+    from megatron.bridge.peft.lora import LoRA
+
+    stub = ProcessGroupCollection()
+    peft = LoRA(target_modules=[module_name], dim=dim, split_qkv_adapters=split)
+    with (
+        patch.object(peft_utils, "HAVE_TE", False),
+        patch.object(ProcessGroupCollection, "use_mpu_process_groups", classmethod(lambda cls, **kwargs: stub)),
+        patch.object(parallel_state, "get_tensor_model_parallel_world_size", lambda: 1),
+    ):
+        return peft.transform(module, module_name, prefix)
+
+
+def test_lora_walk_selects_the_blocked_split_adapter_for_gdn_in_proj():
+    """The walk must build a SplitQKVAdapter in blocked mode from the GDN geometry."""
+    from megatron.core.tensor_parallel import ColumnParallelLinear
+
+    from megatron.bridge.peft.utils import ParallelLinearAdapter, SplitQKVAdapter, is_grouped_expert_linear
+
+    config = _gdn_config()
+    module = ColumnParallelLinear(
+        input_size=64,
+        output_size=112,  # 2 * 32 + 32 + 16
+        config=config,
+        init_method=lambda w: torch.nn.init.normal_(w, std=0.02),
+        gather_output=False,
+        bias=False,
+        skip_bias_add=False,
+        is_expert=False,
+    )
+    prefix = "decoder.layers.0.inner_layer.self_attention"
+    assert not is_grouped_expert_linear(f"{prefix}.in_proj")
+
+    wrapped = _walk_with_gdn_config("in_proj", module, config, prefix)
+
+    adapter = wrapped.adapter
+    assert isinstance(adapter, SplitQKVAdapter)
+    assert adapter._qkv_layout_mode == "blocked"
+    assert adapter._qkv_block_layout == (32, 32, 16)
+    assert adapter._qkv_head_layout is None
+    assert adapter.linear_out.weight.shape[0] == 32
+    assert adapter.k.linear_out.weight.shape[0] == 32
+    assert adapter.v.linear_out.weight.shape[0] == 32
+
+    # Opting out must leave the fused single-pair topology in place.
+    plain = _walk_with_gdn_config("in_proj", module, config, prefix, split=False)
+    assert type(plain.adapter) is ParallelLinearAdapter
+
+
+def test_lora_walk_keeps_a_plain_adapter_for_out_proj():
+    """``out_proj`` is a plain single-pair target: name match only, no split adapter."""
+    from megatron.core.tensor_parallel import RowParallelLinear
+
+    from megatron.bridge.peft.lora import LoRA
+    from megatron.bridge.peft.utils import ParallelLinearAdapter
+
+    # The matcher accepts the bare name (mint adds "out_proj" to its target list).
+    matcher = LoRA(target_modules=["out_proj"], dim=4, split_qkv_adapters=True)
+    assert matcher.match(torch.nn.Linear(4, 4), "out_proj", "decoder.layers.0.inner_layer") is not None
+    assert matcher.match(torch.nn.Linear(4, 4), "in_proj", "decoder.layers.0.inner_layer") is None
+
+    config = _gdn_config()
+    module = RowParallelLinear(
+        input_size=112,
+        output_size=64,
+        config=config,
+        init_method=lambda w: torch.nn.init.normal_(w, std=0.02),
+        bias=False,
+        input_is_parallel=True,
+        skip_bias_add=False,
+        is_expert=False,
+    )
+
+    wrapped = _walk_with_gdn_config(
+        "out_proj", module, config, "decoder.layers.0.inner_layer.self_attention"
+    )
+
+    assert type(wrapped.adapter) is ParallelLinearAdapter
+
+
+# ---------------------------------------------------------------------------
+# Conversion of the GDN ``in_proj`` / ``out_proj`` surfaces
+#
+# The real GLM-5.3-Flash KDA registry (``_kda_attn_mappings``) maps megatron's
+# fused ``in_proj`` to the three HF ``self_attn.{q,k,v}_proj`` weights and
+# ``out_proj`` to ``self_attn.o_proj``, so the split adapter's per-face export
+# needs no in_proj-specific name handling.
+# ---------------------------------------------------------------------------
+
+_GDN_ATTN_LAYER = "decoder.layers.0"
+_GDN_HF_LAYER = "model.language_model.layers.0"
+
+
+def _gdn_kda_registry():
+    """The GLM-5.3-Flash KDA attention mappings, without the language_model prefix."""
+    from megatron.bridge.models.glm5next.glm53flash_bridge import GLM53FlashBridge
+
+    return MegatronMappingRegistry(
+        *GLM53FlashBridge._kda_attn_mappings(_GDN_ATTN_LAYER, _GDN_HF_LAYER)
+    )
+
+
+def _fake_blocked_split_qkv_adapter():
+    """The real SplitQKVAdapter class standing in for a GDN in_proj split adapter.
+
+    The conversion path is duck-typed on the class (``is_split_qkv_adapter``), so
+    the interleaved fake doubles for the blocked mode — the geometry only matters
+    to ``forward`` / ``merged_weight``, neither of which the export touches.
+    """
+    return _fake_split_qkv_adapter()
+
+
+def _build_plain_adapter(in_features: int = 112, out_features: int = 64, dim: int = 8):
+    """A real single-pair ParallelLinearAdapter, as a GDN ``out_proj`` target gets."""
+    from unittest.mock import patch
+
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    from megatron.bridge.peft.utils import ParallelLinearAdapter
+
+    stub = ProcessGroupCollection()
+    with patch.object(ProcessGroupCollection, "use_mpu_process_groups", classmethod(lambda cls, **kwargs: stub)):
+        return ParallelLinearAdapter(
+            in_features,
+            out_features,
+            dim,
+            base_linear_name="decoder.layers.0.inner_layer.self_attention.out_proj",
+            activation="identity",
+            model_parallel_config=_cpu_mp_config(),
+            input_is_parallel=True,
+            base_linear_is_parallel=True,
+        )
+
+
+def plain_adapters_info(base: str):
+    """One enumeration entry for a plain (single-pair) adapter on a row-parallel base."""
+    return [(f"{base}.adapter", base, True, True, False, 8, 8, 0, 0, False, False)]
+
+
+def test_gdn_in_proj_registry_exposes_the_three_faces():
+    """The registry must hand the adapter path three per-face HF names, not the fused one."""
+    registry = _gdn_kda_registry()
+    bridge = DummyBridge()
+    prefix = f"{_GDN_ATTN_LAYER}.inner_layer.self_attention.in_proj"
+
+    base_names = bridge._get_base_hf_param_names_for_adapter(registry, prefix, None, ".weight")
+    assert base_names == [
+        f"{_GDN_HF_LAYER}.self_attn.q_proj.weight",
+        f"{_GDN_HF_LAYER}.self_attn.k_proj.weight",
+        f"{_GDN_HF_LAYER}.self_attn.v_proj.weight",
+    ]
+    for face in ("q", "k", "v"):
+        assert [name for name in base_names if f".{face}_proj." in name] == [
+            f"{_GDN_HF_LAYER}.self_attn.{face}_proj.weight"
+        ]
+    assert bridge._resolve_hf_adapter_param_name(
+        registry, prefix, ".linear_in.weight", ".weight", None
+    ) == f"{_GDN_HF_LAYER}.self_attn.q_proj.lora_A.weight"
+
+    # out_proj is a plain single-name mapping.
+    out_prefix = f"{_GDN_ATTN_LAYER}.inner_layer.self_attention.out_proj"
+    assert bridge._get_base_hf_param_names_for_adapter(registry, out_prefix, None, ".weight") == [
+        f"{_GDN_HF_LAYER}.self_attn.o_proj.weight"
+    ]
+    assert bridge._resolve_hf_adapter_param_name(
+        registry, out_prefix, ".linear_out.weight", ".weight", None
+    ) == f"{_GDN_HF_LAYER}.self_attn.o_proj.lora_B.weight"
+
+
+def test_split_qkv_adapter_blocked_emits_one_task_per_face_for_in_proj(monkeypatch):
+    """Three enumeration entries on ``in_proj`` must yield three face tasks."""
+    from megatron.bridge.models.conversion.peft_bridge import is_split_qkv_adapter
+
+    bridge = DummyBridge()
+    bridge.hf_pretrained = SimpleNamespace()
+    bridge.hf_config = bridge.hf_pretrained
+
+    adapter = _fake_blocked_split_qkv_adapter()
+    assert is_split_qkv_adapter(adapter), "predicate must see the real class"
+
+    base = f"{_GDN_ATTN_LAYER}.inner_layer.self_attention.in_proj"
+    monkeypatch.setattr(
+        bridge, "_megatron_global_adapters_info_all_pp_ranks", lambda *_: _split_qkv_adapters_info(base)
+    )
+    monkeypatch.setattr(bridge, "_get_adapter_wrap_module", lambda *_: (adapter, None))
+    monkeypatch.setattr(
+        "megatron.bridge.models.conversion.model_bridge.parallel_state.get_pipeline_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(bridge, "mapping_registry", _gdn_kda_registry)
+
+    tasks_by_base = bridge.build_adapter_conversion_tasks([Mock()])
+    assert list(tasks_by_base) == [base]
+    tasks = tasks_by_base[base]
+    assert len(tasks) == 3, "one task per face (not per face per entry)"
+    by_face = {task.qkv_face: task for task in tasks}
+    assert sorted(by_face) == ["k", "q", "v"]
+    assert by_face["q"].linear_in_task.param_weight is adapter.linear_in.weight
+    assert by_face["k"].linear_in_task.param_weight is adapter.k.linear_in.weight
+    assert by_face["v"].linear_out_task.param_weight is adapter.v.linear_out.weight
+    # ``_resolve_hf_adapter_param_name`` resolves ONE placeholder name per fused
+    # base (the first registry value, i.e. q_proj); the face-specific name is
+    # chosen by the ``.{face}_proj.`` marker filter in the streaming loop, which
+    # the export test below pins for all three faces.
+    assert by_face["q"].linear_in_task.mapping.hf_param == f"{_GDN_HF_LAYER}.self_attn.q_proj.lora_A.weight"
+    assert by_face["v"].linear_out_task.mapping.hf_param == f"{_GDN_HF_LAYER}.self_attn.q_proj.lora_B.weight"
+
+
+def test_stream_adapter_weights_megatron_to_hf_gdn_in_proj_faces(monkeypatch):
+    """An ``in_proj`` split adapter streams under the three per-face HF names.
+
+    Driven end-to-end through the REAL GLM-5.3-Flash KDA registry: the faces are
+    selected by the ``.{face}_proj.`` marker, so the ``in_proj`` base name needs
+    no special casing, and the fused-slicing path must not run.
+    """
+    bridge = DummyBridge()
+    bridge.hf_pretrained = SimpleNamespace()
+    bridge.hf_config = bridge.hf_pretrained
+
+    base = f"{_GDN_ATTN_LAYER}.inner_layer.self_attention.in_proj"
+    face_tensors = {
+        "q": torch.full((2, 2), 1.0),
+        "k": torch.full((2, 2), 2.0),
+        "v": torch.full((2, 2), 3.0),
+    }
+
+    adapter = _fake_blocked_split_qkv_adapter()
+    monkeypatch.setattr(
+        bridge, "_megatron_global_adapters_info_all_pp_ranks", lambda *_: _split_qkv_adapters_info(base)
+    )
+    monkeypatch.setattr(bridge, "_get_adapter_wrap_module", lambda *_: (adapter, None))
+    monkeypatch.setattr(
+        "megatron.bridge.models.conversion.model_bridge.parallel_state.get_pipeline_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(bridge, "mapping_registry", _gdn_kda_registry)
+    monkeypatch.setattr(
+        bridge,
+        "materialize_adapter_weights",
+        lambda tasks: [
+            AdapterWeight(
+                global_base_prefix=base,
+                adapter_key=None,
+                alpha=2,
+                dim=4,
+                linear_in_weight=MegatronWeightTuple("local_in", torch.ones(2, 2), vp_stage=0),
+                linear_out_weight=MegatronWeightTuple("local_out", face_tensors[tasks[0].qkv_face], vp_stage=0),
+            )
+        ],
+    )
+
+    def _no_fused_slicing(*_args, **_kwargs):
+        raise AssertionError("split q/k/v faces must not go through the fused slicing path")
+
+    monkeypatch.setattr(bridge, "_get_fused_adapter_linear_out_slices", _no_fused_slicing)
+
+    weights = list(
+        bridge.stream_adapter_weights_megatron_to_hf(
+            [SimpleNamespace(config=SimpleNamespace(num_moe_experts=0))],
+            cpu=False,
+            show_progress=False,
+        )
+    )
+
+    assert [w.param_name for w in weights] == [
+        f"{_GDN_HF_LAYER}.self_attn.q_proj.lora_A.weight",
+        f"{_GDN_HF_LAYER}.self_attn.q_proj.lora_B.weight",
+        f"{_GDN_HF_LAYER}.self_attn.k_proj.lora_A.weight",
+        f"{_GDN_HF_LAYER}.self_attn.k_proj.lora_B.weight",
+        f"{_GDN_HF_LAYER}.self_attn.v_proj.lora_A.weight",
+        f"{_GDN_HF_LAYER}.self_attn.v_proj.lora_B.weight",
+    ]
+    torch.testing.assert_close(weights[1].weight, face_tensors["q"])
+    torch.testing.assert_close(weights[3].weight, face_tensors["k"])
+    torch.testing.assert_close(weights[5].weight, face_tensors["v"])
+
+
+def test_stream_adapter_weights_megatron_to_hf_gdn_out_proj_is_one_plain_task(monkeypatch):
+    """``out_proj`` is a single pair and streams under HF ``o_proj``."""
+    bridge = DummyBridge()
+    bridge.hf_pretrained = SimpleNamespace()
+    bridge.hf_config = bridge.hf_pretrained
+
+    base = f"{_GDN_ATTN_LAYER}.inner_layer.self_attention.out_proj"
+    adapter = _build_plain_adapter()
+    monkeypatch.setattr(
+        bridge, "_megatron_global_adapters_info_all_pp_ranks", lambda *_: plain_adapters_info(base)
+    )
+    monkeypatch.setattr(bridge, "_get_adapter_wrap_module", lambda *_: (adapter, None))
+    monkeypatch.setattr(
+        "megatron.bridge.models.conversion.model_bridge.parallel_state.get_pipeline_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(bridge, "mapping_registry", _gdn_kda_registry)
+
+    tasks_by_base = bridge.build_adapter_conversion_tasks([Mock()])
+    assert list(tasks_by_base) == [base]
+    tasks = tasks_by_base[base]
+    assert len(tasks) == 1
+    assert tasks[0].qkv_face is None
+    assert tasks[0].linear_in_task.mapping.hf_param == f"{_GDN_HF_LAYER}.self_attn.o_proj.lora_A.weight"
+    assert tasks[0].linear_out_task.mapping.hf_param == f"{_GDN_HF_LAYER}.self_attn.o_proj.lora_B.weight"
+
+
+
+def test_adapter_wrapper_delegates_output_layer_flags():
+    """``GPTModel``/``HybridModel`` read and ASSIGN ``sequence_parallel`` on
+    their output layer and read ``gather_output`` from it. A LoRA-wrapped
+    output layer must answer both, and an assignment must reach the wrapped
+    linear (a wrapper-local copy would diverge the wrapper from the module
+    that actually runs the gather). Regression for the live failure
+    ``AttributeError: 'LoRALinear' object has no attribute 'gather_output'``
+    (GLM-5.3-Flash, unembed surface enabled)."""
+    import torch.nn as nn
+
+    from megatron.bridge.peft.lora_layers import LoRALinear
+
+    class _FakeOutputLayer(nn.Module):
+        """Stand-in for TE's ColumnParallelLinear output layer: carries the
+        two flags megatron's model code touches, plus a forward."""
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4, 4))
+            self.sequence_parallel = True
+            self.gather_output = False
+
+        def forward(self, x, *args, **kwargs):
+            return x, None
+
+    class _FakeAdapter(nn.Module):
+        def forward(self, x, *args, **kwargs):
+            return x
+
+    base = _FakeOutputLayer()
+    wrapper = LoRALinear(base, _FakeAdapter())
+
+    # Reads delegate to the wrapped linear.
+    assert wrapper.sequence_parallel is True
+    assert wrapper.gather_output is False
+
+    # Assignment reaches the WRAPPED module (not a wrapper-local shadow).
+    wrapper.sequence_parallel = False
+    assert base.sequence_parallel is False, "the setter must write through to the wrapped linear"
+    assert wrapper.sequence_parallel is False
+
+    wrapper.sequence_parallel = True
+    assert base.sequence_parallel is True
+
+    # A wrapped module without the flags still raises AttributeError rather
+    # than silently answering something (same class of error as before the
+    # properties existed).
+    plain = nn.Linear(4, 4)
+    plain_wrapper = LoRALinear(plain, _FakeAdapter())
+    try:
+        plain_wrapper.gather_output
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("a wrapped module without gather_output must not silently answer")
 
 
 def test_dequantize_fp8_blockwise_matches_the_ragged_loop():

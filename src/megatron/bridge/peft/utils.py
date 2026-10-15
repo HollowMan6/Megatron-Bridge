@@ -2001,6 +2001,432 @@ class SplitGateUpAdapter(ParallelLinearAdapter):
         return torch.cat([gate, up], dim=0)
 
 
+class SplitQKVAdapter(ParallelLinearAdapter):
+    """Three independent q/k/v LoRA pairs on a fused q/k/v projection.
+
+    Reference-platform alignment (tinker-official-reference
+    models/glm-5.3-flash.md): the Tinker GLM-5.3-Flash adapter carries
+    SEPARATE ``q_proj`` / ``k_proj`` / ``v_proj`` faces on its 34
+    standard-attention layers, each face with its OWN ``lora_A`` / ``lora_B``
+    pair (live platform probe at r32: ``q_proj`` / ``k_proj`` / ``v_proj``
+    are each ``A[r, 4096]`` / ``B[8192, r]`` per layer). Megatron fuses q, k
+    and v into one linear, so a single ``ParallelLinearAdapter`` on the fused
+    weight would force one rank-``dim`` input subspace and one summed
+    A-gradient trajectory across q/k/v — the same defect class
+    :class:`SplitGateUpAdapter` removes for a fused fc1. This class holds
+    THREE independent pairs and emits their deltas in the fused layout, which
+    is one of two shapes:
+
+    ``qkv_head_layout`` — **interleaved** (self-attention ``linear_qkv``,
+    TE ``TELayerNormColumnParallelLinear``). The fused output is packed per
+    query group as ``[q_1 .. q_hpg, k, v] * num_query_groups``, so the three
+    deltas are interleaved by :meth:`_interleave_qkv`.
+
+    ``qkv_block_layout`` — **blocked** (the GDN / gated-delta-net linear
+    mixer's fused ``in_proj``, ``[q (qk); k (qk); v (v); non-target rows]``
+    with no GQA packing). The three deltas are plain-concatenated; the
+    trailing rows that the platform does NOT train (``z`` / ``f`` / ``b`` /
+    ``w`` ... on the GLM-5.3-Flash KDA layers) carry a ZERO delta so the
+    fused output stays addable wholesale.
+
+    Parameter layout (per rank, TP sharding as the base class):
+    ``linear_in`` / ``linear_out`` = the Q pair (inherited attributes);
+    ``k.linear_in`` / ``k.linear_out`` = the K pair; ``v.*`` = the V pair.
+    The layout kwargs carry the GLOBAL (unsharded) geometry so the fused
+    ordering can be reconstructed; per-rank widths are derived from the
+    tensors themselves, which keeps TP sharding transparent.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        dim: int,
+        *,
+        qkv_head_layout: Optional[Tuple[int, Optional[int], Optional[int]]] = None,
+        qkv_block_layout: Optional[Tuple[int, int, int]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Build the Q pair via the base class plus identical K and V pairs.
+
+        Args:
+            in_features: Input feature dimension.
+            out_features: FUSED output feature dimension of the base linear
+                (q + k + v, plus the non-target rows in blocked mode). Accepted
+                either GLOBAL or per-rank, provided one of the two readings
+                reproduces the derived fused width.
+            dim: Adapter bottleneck dimension.
+            qkv_head_layout: Interleaved mode.
+                ``(num_attention_heads, num_query_groups, kv_channels)`` with
+                GLOBAL head counts. ``num_query_groups`` may be None for full
+                multi-head attention (one k/v head per q head). ``kv_channels``
+                may be None, in which case the head size is inferred from
+                ``out_features``.
+            qkv_block_layout: Blocked mode.
+                ``(qk_dim, v_dim, extra_features_dim)`` with GLOBAL widths:
+                ``qk_dim`` is the q width (and the k width), ``v_dim`` the v
+                width, and ``extra_features_dim`` the width of the trailing
+                non-target rows that follow the v block. Exactly one of
+                ``qkv_head_layout`` / ``qkv_block_layout`` must be given.
+            **kwargs: Forwarded verbatim to :class:`ParallelLinearAdapter` for
+                all three pairs (``model_parallel_config`` is read here to
+                learn ``tensor_model_parallel_size``).
+
+        Raises:
+            ValueError: If neither layout (or both) is given, the layout is
+                internally inconsistent, or it does not reproduce the fused
+                output dimension.
+        """
+        if qkv_head_layout is not None and qkv_block_layout is not None:
+            raise ValueError(
+                "SplitQKVAdapter takes exactly one layout: qkv_head_layout "
+                "(interleaved per-query-group packing, self-attention linear_qkv) or "
+                "qkv_block_layout (block-concatenated [q; k; v; extra], GDN in_proj) — "
+                "not both."
+            )
+        if qkv_head_layout is None and qkv_block_layout is None:
+            raise ValueError(
+                "SplitQKVAdapter requires either qkv_head_layout="
+                "(num_attention_heads, num_query_groups, kv_channels) with GLOBAL head counts "
+                "(interleaved self-attention packing) or qkv_block_layout="
+                "(qk_dim, v_dim, extra_features_dim) with GLOBAL widths (block-concatenated "
+                "GDN in_proj packing); neither the per-face sizes nor the fused layout can be "
+                "derived without one of them."
+            )
+
+        model_parallel_config = kwargs.get("model_parallel_config")
+        tp_size = int(getattr(model_parallel_config, "tensor_model_parallel_size", 1) or 1)
+        if tp_size < 1:
+            tp_size = 1
+
+        if qkv_block_layout is not None:
+            self._init_blocked(qkv_block_layout, in_features, out_features, dim, tp_size, kwargs)
+            return
+        self._qkv_layout_mode = "interleaved"
+        self._qkv_block_layout = None
+        self._qkv_tp_size = tp_size
+
+        raw_heads, raw_groups, raw_kv_channels = qkv_head_layout
+        if raw_heads is None:
+            raise ValueError("SplitQKVAdapter: num_attention_heads must not be None in qkv_head_layout")
+        heads = int(raw_heads)
+        if heads <= 0:
+            raise ValueError(f"SplitQKVAdapter: num_attention_heads must be positive, got {heads}")
+        # ``num_query_groups=None`` => full MHA: one k/v head per query head.
+        groups = heads if raw_groups is None else int(raw_groups)
+        if groups <= 0 or heads % groups != 0:
+            raise ValueError(
+                "SplitQKVAdapter: num_attention_heads must be divisible by num_query_groups, "
+                f"got heads={heads}, groups={groups}"
+            )
+
+        heads_per_group = heads // groups
+        head_total = heads + 2 * groups
+        if raw_kv_channels is not None:
+            head_size = int(raw_kv_channels)
+            if head_size <= 0:
+                raise ValueError(f"SplitQKVAdapter: kv_channels must be positive, got {head_size}")
+        else:
+            # ``kv_channels`` is the only head-size source that is independent of the
+            # fused width, so fall back to the width: megatron packs ``heads +
+            # 2 * groups`` heads on the fused dim. ``get_adapter_attributes_from_linear``
+            # reports the GLOBAL output dim on both base-linear families (TE's
+            # per-partition ``out_features`` is multiplied back by ``tp_size``; MCore's
+            # ``ColumnParallelLinear`` keeps the unsharded ``output_size``), so the
+            # global reading is tried first. The per-rank reading is only a
+            # consistency fallback: with ``tp_size > 1`` and no ``kv_channels`` a
+            # per-rank width that happens to be divisible by ``head_total`` is
+            # indistinguishable from a global one, so callers that know
+            # ``kv_channels`` (the LoRA walk reads it off the module config) should
+            # always pass it.
+            if out_features % head_total == 0:
+                head_size = out_features // head_total
+            elif (out_features * tp_size) % head_total == 0:
+                head_size = (out_features * tp_size) // head_total
+            else:
+                raise ValueError(
+                    "SplitQKVAdapter needs kv_channels, or an output dim divisible by "
+                    f"heads + 2 * groups = {head_total}: got out_features={out_features}, "
+                    f"tensor_model_parallel_size={tp_size}"
+                )
+
+        q_out = heads_per_group * groups * head_size
+        k_out = groups * head_size
+        v_out = groups * head_size
+        face_total = q_out + k_out + v_out
+        if face_total != out_features and face_total != out_features * tp_size:
+            raise ValueError(
+                f"SplitQKVAdapter: derived q/k/v face sizes (q={q_out}, k={k_out}, v={v_out}, "
+                f"total={face_total}) match neither out_features={out_features} nor "
+                f"out_features * tensor_model_parallel_size="
+                f"{out_features * tp_size} (heads={heads}, groups={groups}, "
+                f"head_size={head_size})"
+            )
+
+        self._qkv_head_layout = (heads, groups, head_size)
+
+        super().__init__(in_features, q_out, dim, **kwargs)
+        self.k = ParallelLinearAdapter(in_features, k_out, dim, **kwargs)
+        self.v = ParallelLinearAdapter(in_features, v_out, dim, **kwargs)
+
+    def _init_blocked(
+        self,
+        qkv_block_layout: Tuple[int, int, int],
+        in_features: int,
+        out_features: int,
+        dim: int,
+        tp_size: int,
+        kwargs: dict,
+    ) -> None:
+        """Build the three pairs for the block-concatenated (GDN ``in_proj``) layout.
+
+        The fused output is ``[q (qk_dim); k (qk_dim); v (v_dim); extra]`` with no
+        per-query-group interleaving (``megatron/core/ssm/gated_delta_net``'s
+        ``in_proj_split_sections``), so each pair owns one CONTIGUOUS row block.
+        The trailing ``extra`` rows are not platform targets; the adapter emits a
+        zero delta over them so the fused output stays addable wholesale.
+        """
+        qk_dim, v_dim, extra_features_dim = (int(width) for width in qkv_block_layout)
+        if qk_dim <= 0:
+            raise ValueError(f"SplitQKVAdapter: qk_dim must be positive, got {qk_dim}")
+        if v_dim <= 0:
+            raise ValueError(f"SplitQKVAdapter: v_dim must be positive, got {v_dim}")
+        if extra_features_dim < 0:
+            raise ValueError(
+                f"SplitQKVAdapter: extra_features_dim must be >= 0, got {extra_features_dim}"
+            )
+
+        face_total = 2 * qk_dim + v_dim + extra_features_dim
+        if face_total != out_features and face_total != out_features * tp_size:
+            raise ValueError(
+                f"SplitQKVAdapter: derived blocked fused width (2 * qk_dim + v_dim + extra = "
+                f"2 * {qk_dim} + {v_dim} + {extra_features_dim} = {face_total}) matches neither "
+                f"out_features={out_features} nor out_features * "
+                f"tensor_model_parallel_size={out_features * tp_size}"
+            )
+        # Each of the three pairs is an independent column-parallel linear, so its
+        # own width must shard evenly. An extra block that does not divide leaves
+        # the concatenated per-rank width short of the base linear's shard.
+        for name, width in (("qk_dim", qk_dim), ("v_dim", v_dim), ("extra_features_dim", extra_features_dim)):
+            if width % tp_size:
+                raise ValueError(
+                    f"SplitQKVAdapter: {name}={width} must be divisible by "
+                    f"tensor_model_parallel_size={tp_size}"
+                )
+
+        self._qkv_layout_mode = "blocked"
+        self._qkv_block_layout = (qk_dim, v_dim, extra_features_dim)
+        self._qkv_head_layout = None
+        self._qkv_tp_size = tp_size
+
+        super().__init__(in_features, qk_dim, dim, **kwargs)
+        self.k = ParallelLinearAdapter(in_features, qk_dim, dim, **kwargs)
+        self.v = ParallelLinearAdapter(in_features, v_dim, dim, **kwargs)
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        """Return the adapter delta in the fused base linear's own row order."""
+        query = super().forward(x, *args, **kwargs)
+        key = self.k(x, *args, **kwargs)
+        value = self.v(x, *args, **kwargs)
+        if self._qkv_layout_mode == "blocked":
+            # Plain block concatenation: [q; k; v; zeros(extra)]. The non-target
+            # rows must be present (the fused output is added wholesale) but they
+            # carry no adapter contribution.
+            extra_local = self._qkv_block_layout[2] // self._qkv_tp_size
+            if extra_local == 0:
+                return torch.cat([query, key, value], dim=-1)
+            zeros = query.new_zeros(*query.shape[:-1], extra_local)
+            return torch.cat([query, key, value, zeros], dim=-1)
+        return self._interleave_qkv(query, key, value)
+
+    def _interleave_qkv(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        """Pack per-rank q/k/v deltas into megatron's packed per-group ordering.
+
+        Port of ``LoRALinearSplitQKV._interleave_qkv``
+        (``peft/canonical_lora.py``) driven by the STORED layout instead of the
+        wrapped module's config: for every query group, ``heads_per_group``
+        query rows followed by one key row and one value row. The inputs are
+        the PER-RANK tensors produced by the three sub-adapters, so the local
+        head/group counts are recovered from their widths; the per-group head
+        ratio is checked against the declared global layout.
+        """
+        heads, groups, head_size = self._qkv_head_layout
+        heads_per_group = heads // groups
+
+        query_width, key_width, value_width = query.shape[-1], key.shape[-1], value.shape[-1]
+        for name, width in (("query", query_width), ("key", key_width), ("value", value_width)):
+            if width % head_size != 0:
+                raise ValueError(
+                    f"SplitQKVAdapter: {name} width {width} is not divisible by head_size {head_size}"
+                )
+
+        local_heads = query_width // head_size
+        local_groups = key_width // head_size
+        if value_width // head_size != local_groups:
+            raise ValueError(
+                "SplitQKVAdapter: key and value widths disagree on the local query-group count "
+                f"(key={key_width}, value={value_width}, head_size={head_size})"
+            )
+        if local_groups == 0 or local_heads % local_groups != 0:
+            raise ValueError(
+                "SplitQKVAdapter: local num_attention_heads must be divisible by the local "
+                f"num_query_groups, got heads={local_heads}, groups={local_groups}"
+            )
+        if local_heads // local_groups != heads_per_group:
+            raise ValueError(
+                "SplitQKVAdapter: local heads-per-group "
+                f"({local_heads // local_groups}) disagrees with the declared layout "
+                f"({heads_per_group} for heads={heads}, groups={groups})"
+            )
+
+        leading_shape = query.shape[:-1]
+        query = query.reshape(-1, local_heads, head_size)
+        key = key.reshape(-1, local_groups, head_size)
+        value = value.reshape(-1, local_groups, head_size)
+
+        chunks = []
+        for group in range(local_groups):
+            chunks.append(query[:, group * heads_per_group : (group + 1) * heads_per_group, :])
+            chunks.append(key[:, group : group + 1, :])
+            chunks.append(value[:, group : group + 1, :])
+
+        return torch.cat(chunks, dim=1).reshape(*leading_shape, -1)
+
+    @staticmethod
+    def face_row_indices(
+        heads_per_group: int, head_size: int, num_query_groups: int
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Return the fused-layout row indices of each q/k/v face.
+
+        Megatron's fused ``linear_qkv`` weight is laid out per query group as
+        ``[q rows (heads_per_group * head_size); k rows (head_size); v rows
+        (head_size)]`` — i.e. one contiguous ``head_size``-row block per k/v
+        head, not a single row. ``num_query_groups`` is the count carried by the
+        tensor being indexed (per-rank when the fused base weight is a TP shard,
+        which is exactly the case the merge path uses).
+        """
+        rows_per_group = (heads_per_group + 2) * head_size
+        q_indices: List[int] = []
+        k_indices: List[int] = []
+        v_indices: List[int] = []
+        for group in range(num_query_groups):
+            group_start = group * rows_per_group
+            k_start = group_start + heads_per_group * head_size
+            q_indices.extend(range(group_start, k_start))
+            k_indices.extend(range(k_start, k_start + head_size))
+            v_indices.extend(range(k_start + head_size, k_start + 2 * head_size))
+        return q_indices, k_indices, v_indices
+
+    @staticmethod
+    def blocked_face_row_indices(
+        qk_local: int, v_local: int
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Return the fused-layout row indices of each face in blocked mode.
+
+        The block-concatenated fused weight is ``[q (qk_local); k (qk_local);
+        v (v_local); extra]``, so each face is one contiguous range and the
+        trailing extra rows belong to no face. Widths are the ones carried by
+        the tensor being indexed (per-rank when the fused base weight is a TP
+        shard, which is exactly the case the merge path uses).
+        """
+        q_indices = list(range(0, qk_local))
+        k_indices = list(range(qk_local, 2 * qk_local))
+        v_indices = list(range(2 * qk_local, 2 * qk_local + v_local))
+        return q_indices, k_indices, v_indices
+
+    def face_row_indices_for_layout(
+        self, num_fused_rows: int
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Return each face's row indices in the fused base weight's own layout.
+
+        Mode-aware entry point for the merge path: ``num_fused_rows`` is the
+        fused base weight's row count (global or per-rank, both accepted), from
+        which the per-rank geometry is derived — mirroring
+        :meth:`face_row_indices`'s "the tensor tells you the count" style.
+        """
+        if self._qkv_layout_mode == "blocked":
+            qk_local, v_local, _extra_local = self._blocked_local_sizes(num_fused_rows)
+            return self.blocked_face_row_indices(qk_local, v_local)
+
+        heads, groups, head_size = self._qkv_head_layout
+        heads_per_group = heads // groups
+        rows_per_group = (heads_per_group + 2) * head_size
+        if num_fused_rows % rows_per_group != 0:
+            raise ValueError(
+                "SplitQKVAdapter: fused base weight rows "
+                f"({num_fused_rows}) are not a multiple of one query group's rows "
+                f"({rows_per_group})"
+            )
+        local_groups = num_fused_rows // rows_per_group
+        return self.face_row_indices(heads_per_group, head_size, local_groups)
+
+    def _blocked_local_sizes(self, num_fused_rows: int) -> Tuple[int, int, int]:
+        """Return this tensor's per-rank ``(qk, v, extra)`` widths in blocked mode.
+
+        ``num_fused_rows`` is accepted either GLOBAL or per-rank, the same
+        dual reading the constructor uses for ``out_features``.
+        """
+        qk_dim, v_dim, extra = self._qkv_block_layout
+        tp_size = self._qkv_tp_size
+        if num_fused_rows == 2 * qk_dim + v_dim + extra:
+            return qk_dim, v_dim, extra
+        if num_fused_rows * tp_size == 2 * qk_dim + v_dim + extra:
+            return qk_dim // tp_size, v_dim // tp_size, extra // tp_size
+        raise ValueError(
+            "SplitQKVAdapter: fused base weight rows "
+            f"({num_fused_rows}) match neither the blocked fused width "
+            f"({2 * qk_dim + v_dim + extra}) nor its per-rank shard "
+            f"({(2 * qk_dim + v_dim + extra) // tp_size})"
+        )
+
+    def pairs(
+        self,
+    ) -> Tuple[
+        Tuple[nn.Module, nn.Module], Tuple[nn.Module, nn.Module], Tuple[nn.Module, nn.Module]
+    ]:
+        """Return ((q_in, q_out), (k_in, k_out), (v_in, v_out)) for init/export seams."""
+        return (
+            (self.linear_in, self.linear_out),
+            (self.k.linear_in, self.k.linear_out),
+            (self.v.linear_in, self.v.linear_out),
+        )
+
+    def merged_weight(self, base_weight: torch.Tensor, tp_group: object | None = None) -> torch.Tensor:
+        """Return the effective fused weight (base + per-face q/k/v deltas).
+
+        Each face merges against its OWN row slice of the fused base weight so
+        the result keeps ``base_weight``'s layout and shape: interleaved mode
+        slices per query group (``[q_1 .. q_hpg, k, v]``), blocked mode takes
+        the three contiguous blocks and leaves the trailing extra rows
+        untouched. The geometry is taken from the tensor, which makes the merge
+        correct for a per-rank TP shard as well as for the unsharded weight.
+        Used by the effective-weight path (``LoRALinear.weight``) and merged
+        exports.
+        """
+        from megatron.bridge.peft.lora_merge import LoRAMerge
+
+        q_indices, k_indices, v_indices = self.face_row_indices_for_layout(base_weight.shape[0])
+
+        merge = LoRAMerge()
+        group = tp_group if tp_group is not None else getattr(self, "tp_group", None)
+
+        merged = base_weight.clone()
+        for pair, indices in ((self, q_indices), (self.k, k_indices), (self.v, v_indices)):
+            index = torch.as_tensor(indices, dtype=torch.long, device=base_weight.device)
+            face = merge.merge(
+                torch.index_select(base_weight, 0, index),
+                pair.linear_out.weight,
+                pair.linear_in.weight,
+                pair.alpha,
+                pair.dim,
+                tp_group=group,
+            )
+            merged.index_copy_(0, index, face.to(device=merged.device, dtype=merged.dtype))
+        return merged
+
+
 class _GroupedExpertAdapterWeight(nn.Module):
     """Callable parameter container so DDP forward pre-hooks see grouped LoRA weights."""
 

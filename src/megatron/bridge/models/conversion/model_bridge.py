@@ -52,6 +52,7 @@ from torch.distributed._tensor import DTensor
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
+from megatron.bridge.models.conversion import quantization_utils
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.param_mapping import (
     MegatronParamMapping,
@@ -62,6 +63,7 @@ from megatron.bridge.models.conversion.peft_bridge import (
     MegatronPeftBridge,
 )
 from megatron.bridge.models.conversion.quant_bridge import MegatronQuantizationBridge
+from megatron.bridge.models.conversion.quantization_utils import Fp8BlockwisePair
 from megatron.bridge.models.conversion.transformers_compat import (
     rope_theta_from_hf,
 )
@@ -917,6 +919,35 @@ class MegatronModelBridge(
         """
         raise NotImplementedError("Subclass must implement mapping_registry method")
 
+    @staticmethod
+    def _prefix_mapping_registry(
+        registry: MegatronMappingRegistry, megatron_prefix: str, *extra: MegatronParamMapping
+    ) -> MegatronMappingRegistry:
+        """Re-key a text-model mapping registry for a VLM wrapper.
+
+        VLM bridges typically reuse a text bridge's ``mapping_registry`` but must
+        re-prefix every Megatron parameter (e.g. ``embedding.*`` →
+        ``language_model.embedding.*``) because the language model is a submodule of
+        the VLM wrapper. Concatenation/delegation mappings that hold a nested
+        ``_tp_mapping`` keep it in sync with the parent ``megatron_param``.
+
+        Args:
+            registry: The text-model registry returned by ``super().mapping_registry()``.
+            megatron_prefix: Prefix prepended to each ``megatron_param``.
+            *extra: Additional mappings appended verbatim (e.g. replicated vision
+                weights); they are NOT prefixed.
+
+        Returns:
+            A new ``MegatronMappingRegistry`` with prefixed text mappings + extras.
+        """
+        mappings = list(registry.mappings)
+        for mapping in mappings:
+            mapping.megatron_param = megatron_prefix + mapping.megatron_param
+            nested = getattr(mapping, "_tp_mapping", None)
+            if nested is not None:
+                nested.megatron_param = mapping.megatron_param
+        return MegatronMappingRegistry(*mappings, *extra)
+
     def _megatron_global_param_names_all_pp_ranks(
         self, megatron_model: Union[MegatronModel, List[MegatronModel]]
     ) -> List[str]:
@@ -1020,6 +1051,30 @@ class MegatronModelBridge(
         else:
             hf_weights = {k: hf_state_dict[v] for k, v in hf_param.items()}
         return hf_weights
+
+    def fp8_import_direct_write_enabled(self, megatron_config: TransformerConfig) -> bool:
+        """Whether this bridge may write the checkpoint's FP8 payload into FP8 params.
+
+        Opt-in per bridge: a blockwise-FP8-resident target (``fp8_param``) is the only
+        one whose storage can hold the checkpoint's own bytes, and every bridge has its
+        own checkpoint scale convention to honour. Off by default, so models that only
+        read ``maybe_dequantize_fp8_blockwise`` keep their dequantize path untouched.
+        """
+        return False
+
+    def maybe_load_fp8_direct_weight(
+        self,
+        mapping: MegatronParamMapping,
+        param_weight: Optional[torch.Tensor],
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> Optional[Fp8BlockwisePair | Dict[str, Fp8BlockwisePair]]:
+        """Checkpoint FP8 payload + block scales for a parameter that can take them directly.
+
+        Returning ``None`` keeps this task on the legacy dequantize path; a bridge that
+        opts in via :meth:`fp8_import_direct_write_enabled` implements this to answer,
+        per parameter, whether the checkpoint carries a scale for it.
+        """
+        return None
 
     def maybe_modify_converted_hf_weight(
         self,
@@ -1306,10 +1361,83 @@ class MegatronModelBridge(
         self.unquantized_state_dict = None
 
         _hf_import_cache: Dict[str, torch.Tensor] = {}
+        # A blockwise-FP8-resident target (fp8_param) can receive the checkpoint's FP8
+        # bytes and scales directly. The gate is model-level; the bridge then decides per
+        # parameter whether the checkpoint carries a scale for it. The unquantized-state
+        # capture below needs the *logical* BF16 values of every parameter, so it keeps the
+        # legacy dequantize path.
+        fp8_direct_write = (
+            self.fp8_import_direct_write_enabled(getattr(unwrapped_model_list[0], "config", None))
+            and not capture_unquantized_state_dict
+        )
+        if fp8_direct_write:
+            # Two-pass batched preload. The lazy per-key read path calls
+            # load_tensors once per KEY — each call opens its shard and
+            # materializes the tensor — and the py-spy profile of the
+            # direct-write load pinned that per-query cost (~36 ms/param over
+            # ~4700 FP8 params per rank, ~170 s of the import) as the
+            # dominant half. load_tensors already groups keys by shard, so
+            # ONE call with every needed key opens each shard once and
+            # materializes each tensor once (~41 GB/rank held for the loop;
+            # the host has ~200 GB per worker). The scale keys are included
+            # only where they exist (__contains__ hits the cached all-keys
+            # set); BF16-source params keep their legacy handling.
+            import collections
+
+            payload_keys = set()
+            for task in hf_to_megatron_tasks:
+                if task.megatron_module is None:
+                    continue
+                hf_param = task.mapping.hf_param
+                if isinstance(hf_param, str):
+                    payload_keys.add(hf_param)
+                else:
+                    payload_keys.update(str(name) for name in hf_param.values())
+            scale_keys = {key + "_scale_inv" for key in payload_keys if (key + "_scale_inv") in hf_state_dict}
+            try:
+                preloaded = hf_state_dict[sorted(payload_keys | scale_keys)]
+            except TypeError:
+                # A plain Mapping (the unit tests' fakes) does not support
+                # list keys; the real state source groups them by shard and
+                # opens each shard once. Read per key there.
+                preloaded = {key: hf_state_dict[key] for key in sorted(payload_keys | scale_keys)}
+            hf_state_dict = collections.ChainMap(preloaded, hf_state_dict)
+        # The write side is batched too: one multi-tensor copy per family
+        # per batch of parameters instead of a pageable H2D + sync per
+        # parameter (the measured dominant cost, ~31 ms/param). 64 params per
+        # batch keeps the batch's payloads (~1-2 GB) bounded while amortizing
+        # the launches.
+        _write_batch_size = 64
+        _pending_fp8_writes: list = []
         for task in self._with_progress_tracking(hf_to_megatron_tasks, description):
             # None means megatron module not on current rank, skip if this task is not going to happen
             if task.megatron_module is None:
                 continue
+
+            # 0) Direct blockwise-FP8 write: carry the checkpoint's payload and its
+            # `_scale_inv` through the same mapping and install them in the TE parameter
+            # without a dequantize -> requantize round trip. The dtype of the source is
+            # only knowable by reading it, so a BF16 tensor aimed at an FP8 parameter is
+            # read once here and once by the legacy fetch below; that is a handful of
+            # tensors (lm_head, vision tower, kv_b_proj) against 37k FP8 ones.
+            if fp8_direct_write:
+                hf_fp8 = self.maybe_load_fp8_direct_weight(task.mapping, task.param_weight, hf_state_dict)
+                if hf_fp8 is not None:
+                    assert task.param_weight is not None, "param_weight is required for HF->Megatron conversion"
+                    # no_grad: the param storages are leaf tensors with
+                    # requires_grad=True (TE fp8_model_init) — the legacy
+                    # copy_ below runs under no_grad for exactly this
+                    # reason; the attribute writes here must too.
+                    with torch.no_grad():
+                        rowwise_data, rowwise_scale_inv = task.mapping.hf_to_megatron_fp8(hf_fp8, task.megatron_module)
+                        _pending_fp8_writes.append(
+                            (task.param_weight, rowwise_data, rowwise_scale_inv, task.param_name)
+                        )
+                        if len(_pending_fp8_writes) >= _write_batch_size:
+                            quantization_utils.write_blockwise_fp8_params_batch(_pending_fp8_writes)
+                            _pending_fp8_writes.clear()
+                    continue
+
             # 1) Fetch source tensor(s) from HF state dict, with caching for grouped mappings
             hf_param_key = str(task.mapping.hf_param)
             is_grouped = getattr(task.mapping, "is_grouped_export", False)
@@ -1379,6 +1507,9 @@ class MegatronModelBridge(
                 self.unquantized_state_dict = {"model": captured_state_dicts["model0"]}
             else:
                 self.unquantized_state_dict = captured_state_dicts
+        if _pending_fp8_writes:
+            with torch.no_grad():
+                quantization_utils.write_blockwise_fp8_params_batch(_pending_fp8_writes)
         return megatron_model
 
     def stream_weights_hf_to_megatron(

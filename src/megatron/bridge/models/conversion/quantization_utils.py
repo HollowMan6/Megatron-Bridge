@@ -14,6 +14,7 @@
 
 import math
 from collections.abc import Callable, Mapping
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -76,7 +77,6 @@ def scale_from_amax(amax: torch.Tensor, max_quantized_value: float, scale_dtype:
     return scale
 
 
-
 def _dequantize_blockwise_exact(
     weight: torch.Tensor,
     scale_inv: torch.Tensor,
@@ -124,11 +124,7 @@ def dequantize_fp8_blockwise(
     M, N = weight.shape
     sM, sN = scale_inv.shape
     if M % block_size == 0 and N % block_size == 0:
-        if (
-            weight.device.type == "cpu"
-            and weight.numel() >= _DEQUANT_GPU_MIN_ELEMS
-            and torch.cuda.is_available()
-        ):
+        if weight.device.type == "cpu" and weight.numel() >= _DEQUANT_GPU_MIN_ELEMS and torch.cuda.is_available():
             # GPU offload (measured 2026-10-11 on H20-3e): the exact-block
             # broadcast is memory-bound and ~340x faster on the device than on
             # the host (0.1 ms vs 34 ms for a 4096x2048 expert tensor), which
@@ -177,6 +173,242 @@ def maybe_dequantize_fp8(
     if scale_inv is None:
         return weight.to(dtype)
     return weight.to(dtype) * scale_inv.to(dtype)
+
+
+class Fp8BlockwisePair(NamedTuple):
+    """A checkpoint blockwise-FP8 linear weight: FP8 payload plus its F32 block scales.
+
+    The two tensors travel together through the HF->Megatron mapping so the scale
+    undergoes exactly the layout transform the payload does. ``data`` is held in its
+    raw byte view, which makes every layout op (chunk/cat/transpose/scatter) a byte
+    move that cannot round a value the checkpoint already rounded.
+    """
+
+    data: torch.Tensor
+    scale_inv: torch.Tensor
+
+
+def as_fp8_bytes(weight: torch.Tensor) -> torch.Tensor:
+    """Return the raw bytes of an 8-bit payload without reinterpreting its values."""
+    if weight.dtype == torch.uint8:
+        return weight
+    if is_fp8_tensor(weight) or is_float8_e8m0_dtype(weight.dtype):
+        return weight.view(torch.uint8)
+    raise ValueError(f"expected an 8-bit FP8 payload, got dtype {weight.dtype}")
+
+
+def is_blockwise_fp8_param(param: object) -> bool:
+    """Whether *param* is a TransformerEngine blockwise-FP8 quantized tensor.
+
+    Duck-typed on the rowwise storage instead of ``isinstance`` against TE's class:
+    importing TE would make the conversion path importable only on a host with a
+    working CUDA TE build, while the only thing a direct write needs to know is
+    where the parameter keeps its bytes.
+    """
+    return getattr(param, "_rowwise_data", None) is not None and getattr(param, "_rowwise_scale_inv", None) is not None
+
+
+def blockwise_fp8_scale_block_len(param: object, default: int = FP8_BLOCK_SIZE) -> int:
+    """Block length of a blockwise-FP8 parameter's scale grid (128 for this checkpoint family)."""
+    metadata = {}
+    get_metadata = getattr(param, "get_metadata", None)
+    if callable(get_metadata):
+        try:
+            metadata = get_metadata() or {}
+        except (AttributeError, RuntimeError, TypeError):
+            metadata = {}
+    block_len = getattr(metadata.get("quantizer"), "block_len", None)
+    return int(block_len) if block_len else default
+
+
+def write_blockwise_fp8_param(
+    param: torch.Tensor,
+    rowwise_data: torch.Tensor,
+    rowwise_scale_inv: torch.Tensor,
+    *,
+    param_name: str,
+) -> None:
+    """Install checkpoint FP8 bytes and F32 block scales into a TE blockwise-FP8 param.
+
+    ``QuantizedTensor.copy_`` is not usable here: it dequantizes the source and
+    requantizes with the destination's quantizer, which re-rounds every value. The
+    four TE storages are therefore written directly, and the columnwise orientation
+    (which TE needs for the backward GEMM) is derived as the byte transpose of the
+    rowwise one: with whole 128x128 blocks the transpose maps every block onto a
+    block, so payload bytes and scales are carried over unchanged.
+
+    Fails loudly rather than degrading to a round trip: a parameter whose storage
+    geometry does not match the transported payload is a mapping bug, and silently
+    dequantizing it would reintroduce exactly the error this path exists to remove.
+    """
+    if not is_blockwise_fp8_param(param):
+        raise ValueError(f"{param_name}: destination is not a blockwise FP8 parameter")
+
+    if rowwise_data.ndim != 2:
+        raise ValueError(f"{param_name}: expected a 2D blockwise FP8 payload, got shape {tuple(rowwise_data.shape)}")
+    data = as_fp8_bytes(rowwise_data)
+    block_size = blockwise_fp8_scale_block_len(param)
+    rows, cols = data.shape
+    if rows % block_size or cols % block_size:
+        raise ValueError(
+            f"{param_name}: blockwise FP8 direct write requires whole {block_size}x{block_size} blocks, "
+            f"got payload shape {tuple(data.shape)}"
+        )
+    if tuple(rowwise_scale_inv.shape) != (rows // block_size, cols // block_size):
+        raise ValueError(
+            f"{param_name}: scale grid {tuple(rowwise_scale_inv.shape)} does not match the "
+            f"{block_size}x{block_size} grid of payload shape {tuple(data.shape)}"
+        )
+    if rowwise_scale_inv.dtype != torch.float32:
+        raise ValueError(
+            f"{param_name}: expected F32 block scales — TE only reproduces the checkpoint's "
+            f"dequantization in that scale family (NVTE_FP8_BLOCK_SCALING_FP32_SCALES=1) — "
+            f"got {rowwise_scale_inv.dtype}"
+        )
+
+    target_data = param._rowwise_data
+    target_scale = param._rowwise_scale_inv
+    if tuple(target_data.shape) != (rows, cols):
+        raise ValueError(
+            f"{param_name}: transported payload {tuple(data.shape)} does not match the destination "
+            f"FP8 storage {tuple(target_data.shape)}"
+        )
+    if tuple(target_scale.shape) != tuple(rowwise_scale_inv.shape):
+        raise ValueError(
+            f"{param_name}: transported scales {tuple(rowwise_scale_inv.shape)} do not match the "
+            f"destination FP8 storage {tuple(target_scale.shape)}"
+        )
+    if target_data.element_size() != data.element_size():
+        raise ValueError(
+            f"{param_name}: destination FP8 storage has element size {target_data.element_size()}, "
+            f"cannot carry {data.dtype} bytes"
+        )
+    if target_scale.dtype != rowwise_scale_inv.dtype:
+        raise ValueError(
+            f"{param_name}: destination FP8 storage carries {target_scale.dtype} scales while the "
+            f"checkpoint stores {rowwise_scale_inv.dtype}. These only agree when TE is configured "
+            "for the checkpoint's scale family (NVTE_FP8_BLOCK_SCALING_FP32_SCALES=1): writing F32 "
+            "scales into an E8M0 grid would silently mis-scale every block."
+        )
+
+    device = target_data.device
+    data = data.to(device=device)
+    scale = rowwise_scale_inv.to(device=device)
+    # TE reads both storages as dense buffers, so a strided view (e.g. a column shard
+    # taken without materializing it) would dequantize to garbage while every shape
+    # check above still passed. Materializing is byte-preserving, which is why it is the
+    # cheap half of this guard; the geometry was already validated against the destination.
+    if not data.is_contiguous():
+        data = data.contiguous()
+    if not scale.is_contiguous():
+        scale = scale.contiguous()
+    # TE stores the payload as uint8 bytes; a TE build that keeps the FP8 dtype on the
+    # storage is served by the same bytes.
+    if target_data.dtype != torch.uint8 and target_data.dtype != data.dtype:
+        data = data.view(target_data.dtype)
+
+    param._rowwise_data = data
+    param._rowwise_scale_inv = scale
+    if getattr(param, "_columnwise_data", None) is not None:
+        # The destination's EXISTING columnwise storages are validated like
+        # the rowwise pair before being replaced: a TE-created blockwise
+        # param agrees with the derived (transposed) shapes by construction,
+        # so a mismatch means the param is not the geometry the checkpoint
+        # implies — fail loud instead of silently replacing it.
+        if tuple(param._columnwise_data.shape) != (cols, rows):
+            raise ValueError(
+                f"{param_name}: destination columnwise storage has shape "
+                f"{tuple(param._columnwise_data.shape)}, expected the transpose "
+                f"({cols}, {rows}) of the rowwise payload"
+            )
+        if tuple(param._columnwise_scale_inv.shape) != (
+            rowwise_scale_inv.shape[1],
+            rowwise_scale_inv.shape[0],
+        ):
+            raise ValueError(
+                f"{param_name}: destination columnwise scale grid has shape "
+                f"{tuple(param._columnwise_scale_inv.shape)}, expected the transpose "
+                f"({rowwise_scale_inv.shape[1]}, {rowwise_scale_inv.shape[0]}) of the "
+                "rowwise grid"
+            )
+        param._columnwise_data = data.t().contiguous()
+        param._columnwise_scale_inv = scale.t().contiguous()
+
+
+def write_blockwise_fp8_params_batch(entries) -> None:
+    """Write a batch of (param, rowwise_data, rowwise_scale_inv, param_name)
+    triples with ONE multi-tensor copy per tensor family.
+
+    The per-parameter pageable H2D in write_blockwise_fp8_param was the
+    measured dominant cost of the direct-write import (~31 ms/param over
+    ~4700 params per rank, ~145 s): each payload.to(device) allocates a
+    staging buffer and synchronizes. Grouping the parameters and copying
+    with torch._foreach_copy_ amortizes the launches and the sync across the
+    batch; the destinations keep TE's own storages (in-place, no rebinding).
+
+    Validates every entry BEFORE copying anything, so a bad entry fails loud
+    without half-writing the batch. Callers must batch under no_grad.
+    """
+    if not entries:
+        return
+    # Validate first: the same checks as the single writer, none of the writes.
+    prepared = []
+    for param, data, scale_inv, param_name in entries:
+        if not is_blockwise_fp8_param(param):
+            raise ValueError(f"{param_name}: destination is not a blockwise FP8 parameter")
+        if data.ndim != 2:
+            raise ValueError(
+                f"{param_name}: blockwise FP8 direct import requires a 2-D payload, "
+                f"got ndim={data.ndim} shape {tuple(data.shape)}"
+            )
+        rows, cols = data.shape
+        block_size = blockwise_fp8_scale_block_len(param)
+        if rows % block_size or cols % block_size:
+            raise ValueError(
+                f"{param_name}: blockwise FP8 direct import requires whole "
+                f"{block_size}x{block_size} blocks, got payload shape {tuple(data.shape)}"
+            )
+        target_data = param._rowwise_data
+        target_scale = param._rowwise_scale_inv
+        if tuple(target_data.shape) != (rows, cols):
+            raise ValueError(
+                f"{param_name}: destination FP8 storage has shape {tuple(target_data.shape)}, "
+                f"payload shape is {(rows, cols)}"
+            )
+        if tuple(target_scale.shape) != tuple(scale_inv.shape):
+            raise ValueError(
+                f"{param_name}: destination scale grid {tuple(target_scale.shape)} does not "
+                f"match payload grid {tuple(scale_inv.shape)}"
+            )
+        if scale_inv.dtype != torch.float32 or target_scale.dtype != torch.float32:
+            raise ValueError(
+                f"{param_name}: blockwise FP8 scales must be F32 on both sides (the "
+                "checkpoint family and the destination family), got "
+                f"{scale_inv.dtype}/{target_scale.dtype}"
+            )
+        if target_data.dtype != torch.uint8 or data.dtype != torch.uint8:
+            raise ValueError(
+                f"{param_name}: the batched writer copies raw bytes, expected uint8 on both "
+                f"sides, got {data.dtype} -> {target_data.dtype}"
+            )
+        prepared.append((param, data, scale_inv, param_name, rows, cols))
+
+    # One multi-tensor H2D per family: N payload copies + N scale copies in
+    # two launches, one synchronization each.
+    with torch.no_grad():
+        torch._foreach_copy_([entry[0]._rowwise_data for entry in prepared], [entry[1] for entry in prepared])
+        torch._foreach_copy_([entry[0]._rowwise_scale_inv for entry in prepared], [entry[2] for entry in prepared])
+        # The columnwise orientation is derived per parameter — GPU transposes,
+        # cheap next to the batched H2D.
+        for param, _data, scale_inv, param_name, rows, cols in prepared:
+            if getattr(param, "_columnwise_data", None) is not None:
+                if tuple(param._columnwise_data.shape) != (cols, rows):
+                    raise ValueError(
+                        f"{param_name}: destination columnwise storage has shape "
+                        f"{tuple(param._columnwise_data.shape)}, expected ({cols}, {rows})"
+                    )
+                param._columnwise_data = param._rowwise_data.t().contiguous()
+                param._columnwise_scale_inv = scale_inv.t().contiguous().to(param._rowwise_data.device)
 
 
 def dequantize_fp8_e4m3fn_with_scale(

@@ -14,7 +14,7 @@
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -37,6 +37,7 @@ from megatron.bridge.peft.utils import (
     ParallelLinearAdapter,
     SharedOuterGroupedExpertAdapter,
     SplitGateUpAdapter,
+    SplitQKVAdapter,
     align_expert_dim_for_tp,
     get_adapter_attributes_from_linear,
     get_effective_lora_dim,
@@ -87,6 +88,76 @@ def get_lora_plus_config_overrides(
         base_lr * lora_plus_ratio,
     )
     return config_overrides
+
+
+def gdn_in_proj_block_layout(
+    config: object,
+    out_features: int,
+    tp_size: int = 1,
+) -> Optional[Tuple[int, int, int]]:
+    """Derive the blocked q/k/v geometry of a GDN (KDA / linear-attention) ``in_proj``.
+
+    ``megatron/core/ssm/gated_delta_net`` fuses q, k and v into ONE
+    block-concatenated ``in_proj`` whose sections are read straight off the
+    config (``common.py``: ``self.qk_dim = config.linear_key_head_dim *
+    config.linear_num_key_heads`` and ``self.v_dim =
+    config.linear_value_head_dim * config.linear_num_value_heads``, then
+    ``in_proj_split_sections`` starts ``[qk, qk, v, ...]``). The rows after the
+    v block (``z`` / ``f`` / ``b`` / ``w`` ... depending on the variant) are NOT
+    platform LoRA targets, so they are passed through as a zero delta.
+
+    Args:
+        config: The base linear's config. The geometry is read as
+            ``linear_key_head_dim`` / ``linear_num_key_heads`` /
+            ``linear_value_head_dim`` / ``linear_num_value_heads`` with the
+            mixer's own shorter spellings (``key_head_dim`` / ``num_key_heads``
+            / ``value_head_dim`` / ``num_value_heads``) accepted as fallbacks.
+        out_features: The fused ``in_proj`` output width reported by
+            ``get_adapter_attributes_from_linear`` — GLOBAL on both base-linear
+            families, with the per-rank reading accepted as a fallback.
+        tp_size: Tensor-parallel size, for that per-rank fallback.
+
+    Returns:
+        ``(qk_dim, v_dim, extra_features_dim)`` with GLOBAL widths, or ``None``
+        when the config exposes no GDN geometry (so the module is not a GDN
+        ``in_proj`` and the caller must not select the split adapter).
+
+    Raises:
+        ValueError: The config DOES expose the GDN geometry but neither the
+            global nor the per-rank reading of ``out_features`` leaves room for
+            the q/k/v blocks. That is a real mismatch, not a non-GDN module, so
+            it fails loudly rather than silently degrading to a fused adapter.
+    """
+
+    def _geom(primary: str, fallback: str) -> Optional[int]:
+        value = getattr(config, primary, None)
+        if value is None:
+            value = getattr(config, fallback, None)
+        return None if value is None else int(value)
+
+    key_heads = _geom("linear_num_key_heads", "num_key_heads")
+    key_head_dim = _geom("linear_key_head_dim", "key_head_dim")
+    value_heads = _geom("linear_num_value_heads", "num_value_heads")
+    value_head_dim = _geom("linear_value_head_dim", "value_head_dim")
+    if key_heads is None or key_head_dim is None or value_heads is None or value_head_dim is None:
+        return None
+
+    qk_dim = key_heads * key_head_dim
+    v_dim = value_heads * value_head_dim
+    qkv_dim = 2 * qk_dim + v_dim
+    if out_features >= qkv_dim:
+        extra_features_dim = out_features - qkv_dim
+    elif out_features * max(tp_size, 1) >= qkv_dim:
+        extra_features_dim = out_features * max(tp_size, 1) - qkv_dim
+    else:
+        raise ValueError(
+            "GDN in_proj split: the config's q/k/v geometry "
+            f"(2 * qk_dim + v_dim = 2 * {qk_dim} + {v_dim} = {qkv_dim}) does not fit the fused "
+            f"in_proj out_features={out_features} under either the global or the "
+            f"tensor_model_parallel_size={tp_size} reading. Set "
+            "split_qkv_adapters=False for this model, or fix the GDN head geometry on the config."
+        )
+    return (qk_dim, v_dim, extra_features_dim)
 
 
 @dataclass
@@ -149,6 +220,28 @@ class LoRA(PEFT, ModuleMatcher):
             ``gateA != upA``). Default False keeps the fused single-pair
             topology (reference behaviour for the routed grouped-expert
             surfaces, where the platform also fuses).
+        split_qkv_adapters (bool): When True, a fused q/k/v projection gets
+            THREE independent rank-``dim`` adapter pairs — one per q / k / v
+            face — instead of one pair shared by the whole fused output.
+            Matches the reference platform's GLM-5.3-Flash adapter, which
+            carries SEPARATE ``q_proj`` / ``k_proj`` / ``v_proj`` faces (each
+            with its own ``lora_A`` / ``lora_B``) on both of its attention
+            families (tinker-official-reference models/glm-5.3-flash.md, live
+            r32 platform probe; the conversion emits the same three faces for
+            either). Two fused surfaces are covered:
+              * ``linear_qkv`` (self-attention), where the fused rows are
+                packed per query group and the adapter rebuilds that
+                interleaving;
+              * ``in_proj`` (the GDN / KDA linear-attention mixer), where the
+                fused rows are the block concatenation ``[q; k; v; extra]``
+                and the non-target ``extra`` rows (``z`` / ``f`` / ``b`` /
+                ``w`` ...) receive a zero delta. The q/k/v widths come from the
+                GDN head geometry on the module config (see
+                :func:`gdn_in_proj_block_layout`).
+            ``out_proj`` (the GDN mixer's output projection, HF ``o_proj``)
+            needs no flag: it is a plain single-pair target, so listing it in
+            ``target_modules`` is enough. Default False keeps the fused
+            single-pair topology.
     """
 
     target_modules: List[str] = field(
@@ -167,6 +260,7 @@ class LoRA(PEFT, ModuleMatcher):
     share_expert_adapters: bool = True
     experts_shared_outer_loras: bool = False
     split_gate_up_adapters: bool = False
+    split_qkv_adapters: bool = False
 
     def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
         """
@@ -231,10 +325,44 @@ class LoRA(PEFT, ModuleMatcher):
                 and str(full_name).endswith("linear_fc1")
                 and bool(getattr(module.config, "gated_linear_unit", False))
             )
+            # Fused q/k/v surfaces (megatron ``linear_qkv``, i.e. the attention
+            # q/k/v projection as one TE/MCore column-parallel linear) get three
+            # independent pairs when the caller opts in — the reference
+            # platform's per-face ``q_proj`` / ``k_proj`` / ``v_proj``
+            # adapters. The head layout must be readable off the module config
+            # because the adapter has to rebuild megatron's per-query-group
+            # interleaved packing.
+            qkv_layout_available = getattr(module.config, "num_attention_heads", None) is not None
+            use_split_qkv_adapter = (
+                self.split_qkv_adapters
+                and not is_grouped_expert_name
+                and str(full_name).endswith("linear_qkv")
+                and qkv_layout_available
+            )
+            # The GDN / KDA linear-attention mixer fuses q, k and v into
+            # ``in_proj`` with a BLOCK-CONCATENATED output ([q; k; v; extra],
+            # no per-query-group packing), and the reference platform carries the
+            # same three ``q_proj`` / ``k_proj`` / ``v_proj`` faces on it. The
+            # geometry comes from the GDN head config, so the gate is "the config
+            # exposes that geometry", not a fixed architecture name.
+            gdn_block_layout = (
+                gdn_in_proj_block_layout(
+                    module.config,
+                    attrs.out_features,
+                    getattr(module.config, "tensor_model_parallel_size", 1) or 1,
+                )
+                if self.split_qkv_adapters
+                and not is_grouped_expert_name
+                and str(full_name).endswith("in_proj")
+                else None
+            )
+            use_split_in_proj_adapter = gdn_block_layout is not None
 
             enable_op_fuser = (
                 not use_grouped_expert_adapter
                 and not use_split_gate_up_adapter
+                and not use_split_qkv_adapter
+                and not use_split_in_proj_adapter
                 and not is_expert
                 and getattr(module.config, "use_transformer_engine_op_fuser", False)
                 # TP not yet supported
@@ -248,6 +376,8 @@ class LoRA(PEFT, ModuleMatcher):
                 adapter_cls = GroupedExpertLinearAdapter
             elif use_split_gate_up_adapter:
                 adapter_cls = SplitGateUpAdapter
+            elif use_split_qkv_adapter or use_split_in_proj_adapter:
+                adapter_cls = SplitQKVAdapter
             else:
                 adapter_cls = ParallelLinearAdapter
             adapter_kwargs = dict(
@@ -277,6 +407,24 @@ class LoRA(PEFT, ModuleMatcher):
                     disable_tensor_parallel_comm=attrs.disable_tensor_parallel_comm,
                     disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
                 )
+            if use_split_qkv_adapter:
+                # ``qkv_head_layout`` is keyword-only on SplitQKVAdapter, and the
+                # kwargs dict is shared with the plain path, so the key is only
+                # added on the branch that selected the split adapter.
+                # ``num_query_groups=None`` means full MHA; the adapter normalises
+                # it. ``kv_channels`` may be absent on some configs — the adapter
+                # then infers the head size from the fused output dim.
+                adapter_kwargs.update(
+                    qkv_head_layout=(
+                        getattr(module.config, "num_attention_heads", None),
+                        getattr(module.config, "num_query_groups", None),
+                        getattr(module.config, "kv_channels", None),
+                    )
+                )
+            elif use_split_in_proj_adapter:
+                # Same class, blocked mode: ``qkv_block_layout`` carries the GDN
+                # geometry and is mutually exclusive with ``qkv_head_layout``.
+                adapter_kwargs.update(qkv_block_layout=gdn_block_layout)
             adapter = adapter_cls(attrs.in_features, attrs.out_features, dim, **adapter_kwargs)
             if isinstance(module, TopKRouter):
                 return LoRATopKRouter(module, adapter)

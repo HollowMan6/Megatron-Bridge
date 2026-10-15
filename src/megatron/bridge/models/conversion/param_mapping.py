@@ -30,6 +30,12 @@ from megatron.core.utils import (
 )
 from torch.distributed._tensor import DTensor
 
+from megatron.bridge.models.conversion.quantization_utils import (
+    Fp8BlockwisePair,
+    as_fp8_bytes,
+    blockwise_fp8_scale_block_len,
+    is_blockwise_fp8_param,
+)
 from megatron.bridge.models.conversion.utils import (
     get_module_and_param_from_name,
     is_modelopt_dynamic_module,
@@ -608,7 +614,14 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
 
         scatter_list = None
         if self.tp_rank == src_rank and splits:
-            scatter_list = [s.to(device=device, dtype=dtype).contiguous() for s in splits]
+            # ONE multi-tensor H2D for the whole batch of splits instead of a
+            # pageable copy + sync PER SPLIT (tp_size synchronous H2Ds per
+            # parameter). The foreach copy writes dense CUDA buffers, so the
+            # contiguity call the old loop had is unnecessary; _foreach_copy_
+            # carries the same cast semantics as .to(dtype=dtype).
+            staged = [torch.empty(s.shape, dtype=dtype, device=device) for s in splits]
+            torch._foreach_copy_(staged, splits)
+            scatter_list = staged
 
         torch.distributed.scatter(
             output,
@@ -895,6 +908,123 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
             return tensor.dequantize(dtype=tensor.dtype)
         return tensor
 
+    # ------------------------------------------------------------------
+    # Blockwise-FP8 direct import
+    # ------------------------------------------------------------------
+
+    def hf_to_megatron_fp8(
+        self,
+        hf_fp8: Fp8BlockwisePair | Dict[str, Fp8BlockwisePair],
+        megatron_module: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map a blockwise-FP8 payload plus its scales into this rank's Megatron layout.
+
+        Returns ``(rowwise_data, rowwise_scale_inv)`` for
+        :func:`megatron.bridge.models.conversion.quantization_utils.write_blockwise_fp8_param`.
+        The scale has to follow the payload through the SAME op sequence — a chunk of the
+        payload along dim 0 is a chunk of its scale grid along dim 0, a transpose of one is
+        a transpose of the other. A mapping whose transform cannot be expressed that way
+        keeps this implementation so the caller fails loudly instead of quietly falling
+        back to dequantize -> copy, which would re-round every value.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot carry blockwise-FP8 scales through the HF->Megatron "
+            f"mapping (megatron_param={self.megatron_param!r}, hf_param={self.hf_param!r}). "
+            "Implement hf_to_megatron_fp8 for this mapping, or import this model without fp8_param."
+        )
+
+    def _fp8_target_param(self, megatron_module: nn.Module) -> torch.Tensor:
+        """The destination blockwise-FP8 parameter of this mapping on the current rank."""
+        normalized_param = self._normalize_expert_param_name(self.megatron_param)
+        _, target = get_module_and_param_from_name(megatron_module, normalized_param)
+        if not is_blockwise_fp8_param(target):
+            raise ValueError(
+                f"{normalized_param}: expected a blockwise FP8 parameter to receive the checkpoint's "
+                "FP8 payload, got a tensor without rowwise FP8 storage."
+            )
+        return target
+
+    def _fp8_validate_pair(
+        self,
+        data: torch.Tensor,
+        scale_inv: torch.Tensor,
+        megatron_module: nn.Module,
+        target: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Check a transported payload/scale pair against the destination FP8 storage.
+
+        This is the single choke point every mapping's FP8 transport goes through, so a
+        layout op that lost (or gained) a shard, or a checkpoint whose dims are not whole
+        128-blocks, fails here naming the parameter instead of landing half-written.
+        """
+        # The caller usually resolved the target already (the transports need
+        # it for the chunk/scatter shapes) — accept it here so the name walk
+        # runs ONCE per parameter instead of twice.
+        if target is None:
+            target = self._fp8_target_param(megatron_module)
+        data = as_fp8_bytes(data)
+        block_size = blockwise_fp8_scale_block_len(target)
+        if data.ndim != 2:
+            # Guard BEFORE the unpack: a 3-D payload (a fused-expert mapping
+            # reaching the wrong transport) must fail here naming the
+            # parameter, not as a bare "too many values to unpack".
+            raise ValueError(
+                f"{self.megatron_param}: blockwise FP8 direct import requires "
+                f"a 2-D payload, got ndim={data.ndim} shape {tuple(data.shape)}"
+            )
+        rows, cols = data.shape
+        if rows % block_size or cols % block_size:
+            raise ValueError(
+                f"{self.megatron_param}: blockwise FP8 direct import requires whole "
+                f"{block_size}x{block_size} blocks, got payload shape {tuple(data.shape)}"
+            )
+        if tuple(scale_inv.shape) != (rows // block_size, cols // block_size):
+            raise ValueError(
+                f"{self.megatron_param}: transported scale grid {tuple(scale_inv.shape)} does not match "
+                f"the {block_size}x{block_size} grid of payload shape {tuple(data.shape)}"
+            )
+        for label, got, want in (
+            ("payload", data, target._rowwise_data),
+            ("scales", scale_inv, target._rowwise_scale_inv),
+        ):
+            if tuple(got.shape) != tuple(want.shape):
+                raise ValueError(
+                    f"{self.megatron_param}: transported {label} {tuple(got.shape)} does not match the "
+                    f"destination FP8 storage {tuple(want.shape)}"
+                )
+        device = target._rowwise_data.device
+        return data.to(device=device), scale_inv.to(device=device)
+
+
+def _fp8_chunk(
+    tensor: torch.Tensor,
+    parts: int,
+    dim: int,
+    param_name: str,
+    what: str,
+) -> list[torch.Tensor]:
+    """Split a payload or scale grid across TP ranks, failing loud on a ragged split."""
+    if tensor.ndim <= dim:
+        raise ValueError(
+            f"{param_name}: {what} has ndim={tensor.ndim}, cannot index dimension {dim} for the tensor-parallel split"
+        )
+    if tensor.shape[dim] % parts:
+        raise ValueError(
+            f"{param_name}: {what} dimension {dim} of size {tensor.shape[dim]} cannot be split "
+            f"evenly across {parts} tensor-parallel ranks"
+        )
+    return list(torch.chunk(tensor, parts, dim=dim))
+
+
+# NOTE for the next bridge that opts into FP8 direct import: the Fused*
+# mapping subclasses (FusedExpertMapping / FusedGatedExpertMapping /
+# RMSNorm2ZeroCenteredRMSNormMapping) override hf_to_megatron with extra
+# semantics (expert slicing, gate/up fusion, zero-centering) but INHERIT
+# AutoMapping.hf_to_megatron_fp8, which does not apply those semantics to an
+# FP8 payload — a 3-D payload would reach the transports and fail loud at
+# _fp8_validate_pair's ndim guard. If such a mapping must support FP8 direct
+# import, implement hf_to_megatron_fp8 on the subclass explicitly.
+
 
 class DirectMapping(MegatronParamMapping[torch.Tensor]):
     """Direct 1:1 weight mapping with no transformation or tensor parallelism."""
@@ -923,6 +1053,14 @@ class DirectMapping(MegatronParamMapping[torch.Tensor]):
         megatron_weights = self.maybe_dequantize(megatron_weights)
 
         return {str(self.hf_param): megatron_weights}
+
+    def hf_to_megatron_fp8(
+        self,
+        hf_fp8: Fp8BlockwisePair,
+        megatron_module: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Direct 1:1 copy of the checkpoint's FP8 payload and its scales."""
+        return self._fp8_validate_pair(hf_fp8.data, hf_fp8.scale_inv, megatron_module)
 
 
 class ColumnParallelMapping(MegatronParamMapping[torch.Tensor]):
@@ -1034,6 +1172,48 @@ class ColumnParallelMapping(MegatronParamMapping[torch.Tensor]):
             target_param.dtype,
             target_param.device,
         )
+
+    def hf_to_megatron_fp8(
+        self,
+        hf_fp8: Fp8BlockwisePair,
+        megatron_module: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split payload and scale grid along dim 0, then scatter them to the TP ranks.
+
+        The payload stays raw bytes throughout: casting it to the parameter's *logical*
+        dtype would destroy it, because TE reports the fake BF16 dtype on a quantized
+        tensor.
+        """
+        target = self._fp8_target_param(megatron_module)
+        if self.tp_size == 1:
+            return self._fp8_validate_pair(hf_fp8.data, hf_fp8.scale_inv, megatron_module)
+
+        if self.tp_rank == 0:
+            data_splits = _fp8_chunk(hf_fp8.data, self.tp_size, 0, self.megatron_param, "payload")
+            scale_splits = _fp8_chunk(hf_fp8.scale_inv, self.tp_size, 0, self.megatron_param, "scale grid")
+        else:
+            data_splits = None
+            scale_splits = None
+
+        # Normalize the payload to raw uint8 bytes before the collective:
+        # scatter_to_tp_ranks casts to the destination dtype, and a float8
+        # payload cast to uint8 would reinterpret the VALUES as bit patterns
+        # (silent byte corruption) rather than move them. The payload is
+        # already canonicalized at the record boundary; this re-normalizes
+        # defensively so the cast below is always a no-op on bytes.
+        data = self.scatter_to_tp_ranks(
+            [as_fp8_bytes(s) for s in data_splits] if data_splits else None,
+            tuple(target._rowwise_data.shape),
+            torch.uint8,
+            target._rowwise_data.device,
+        )
+        scale_inv = self.scatter_to_tp_ranks(
+            scale_splits,
+            tuple(target._rowwise_scale_inv.shape),
+            target._rowwise_scale_inv.dtype,
+            target._rowwise_scale_inv.device,
+        )
+        return self._fp8_validate_pair(data, scale_inv, megatron_module, target=target)
 
     def megatron_to_hf(
         self,
@@ -1198,6 +1378,53 @@ class RowParallelMapping(MegatronParamMapping[torch.Tensor]):
             target_param.device,
         )
 
+    def hf_to_megatron_fp8(
+        self,
+        hf_fp8: Fp8BlockwisePair,
+        megatron_module: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split payload and scale grid along dim 1, then scatter them to the TP ranks.
+
+        The layout heuristic is the one the BF16 path uses (some checkpoints store the
+        fused expert ``down_proj`` as ``[in, out]``); it is evaluated on the payload's
+        shape and then applied to the scale grid as well, so the two cannot disagree.
+        """
+        target = self._fp8_target_param(megatron_module)
+        data, scale_inv = hf_fp8.data, hf_fp8.scale_inv
+        if data.ndim == 2 and data.shape[0] != target.shape[0] and data.shape[1] == target.shape[0]:
+            data = data.t().contiguous()
+            scale_inv = scale_inv.t().contiguous()
+
+        if self.tp_size == 1:
+            return self._fp8_validate_pair(data, scale_inv, megatron_module, target=target)
+
+        if self.tp_rank == 0:
+            data_splits = _fp8_chunk(data, self.tp_size, 1, self.megatron_param, "payload")
+            scale_splits = _fp8_chunk(scale_inv, self.tp_size, 1, self.megatron_param, "scale grid")
+        else:
+            data_splits = None
+            scale_splits = None
+
+        # Normalize the payload to raw uint8 bytes before the collective:
+        # scatter_to_tp_ranks casts to the destination dtype, and a float8
+        # payload cast to uint8 would reinterpret the VALUES as bit patterns
+        # (silent byte corruption) rather than move them. The payload is
+        # already canonicalized at the record boundary; this re-normalizes
+        # defensively so the cast below is always a no-op on bytes.
+        data = self.scatter_to_tp_ranks(
+            [as_fp8_bytes(s) for s in data_splits] if data_splits else None,
+            tuple(target._rowwise_data.shape),
+            torch.uint8,
+            target._rowwise_data.device,
+        )
+        scale_inv = self.scatter_to_tp_ranks(
+            scale_splits,
+            tuple(target._rowwise_scale_inv.shape),
+            target._rowwise_scale_inv.dtype,
+            target._rowwise_scale_inv.device,
+        )
+        return self._fp8_validate_pair(data, scale_inv, megatron_module, target=target)
+
     def megatron_to_hf(
         self,
         megatron_weights: Optional[torch.Tensor],
@@ -1313,6 +1540,25 @@ class ReplicatedMapping(MegatronParamMapping[torch.Tensor]):
 
         # Broadcast from rank 0 to all TP ranks
         return self.broadcast_tensor_to_tp_ranks(hf_weights, src_rank=0)
+
+    def hf_to_megatron_fp8(
+        self,
+        hf_fp8: Fp8BlockwisePair,
+        megatron_module: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Replicate the payload and its scale grid to every TP rank.
+
+        Rank 0 owns the checkpoint bytes; the other ranks contribute their allocation
+        and receive the broadcast, exactly as the BF16 path does.
+        """
+        target = self._fp8_target_param(megatron_module)
+        device = target._rowwise_data.device
+        data = hf_fp8.data.to(device=device)
+        scale_inv = hf_fp8.scale_inv.to(device=device)
+        if self.tp_size > 1:
+            data = self.broadcast_tensor_to_tp_ranks(data, src_rank=0)
+            scale_inv = self.broadcast_tensor_to_tp_ranks(scale_inv, src_rank=0)
+        return self._fp8_validate_pair(data, scale_inv, megatron_module, target=target)
 
     def megatron_to_hf(
         self,
@@ -1574,6 +1820,22 @@ class AutoMapping(MegatronParamMapping[torch.Tensor]):
             self._mapping = self._get_or_create_mapping(self._detected_type)
 
         return self._mapping.hf_to_megatron(hf_weights, megatron_module)
+
+    def hf_to_megatron_fp8(
+        self,
+        hf_fp8: Fp8BlockwisePair,
+        megatron_module: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Permute payload and scale grid identically, then delegate to the detected mapping."""
+        if self.permute_dims is not None:
+            hf_fp8 = Fp8BlockwisePair(
+                hf_fp8.data.permute(self.permute_dims).contiguous(),
+                hf_fp8.scale_inv.permute(self.permute_dims).contiguous(),
+            )
+        if self._mapping is None:
+            self._detected_type = self._detect_parallelism_type(megatron_module)
+            self._mapping = self._get_or_create_mapping(self._detected_type)
+        return self._mapping.hf_to_megatron_fp8(hf_fp8, megatron_module)
 
     def megatron_to_hf(
         self,
@@ -2686,6 +2948,76 @@ class GatedMLPMapping(MegatronParamMapping[Dict[str, torch.Tensor]]):
             target_param.device,
         )
 
+    def hf_to_megatron_fp8(
+        self,
+        hf_fp8: Dict[str, Fp8BlockwisePair],
+        megatron_module: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fuse ``[gate; up]`` for payload and scale grid alike, then scatter to TP ranks.
+
+        Each rank receives its own gate shard over its own up shard, so the fused
+        payload and the fused scale grid stay in step: one grid row per 128 payload
+        rows on both halves.
+        """
+        gate, up = hf_fp8["gate"], hf_fp8["up"]
+        if gate.data.shape != up.data.shape:
+            raise ValueError(
+                f"{self.megatron_param}: gate payload {tuple(gate.data.shape)} and up payload "
+                f"{tuple(up.data.shape)} must have the same shape to be fused"
+            )
+        target = self._fp8_target_param(megatron_module)
+        if self.tp_size == 1:
+            # Fuse on the GPU, not the CPU: the [gate; up] concat is a memcpy
+            # of the whole payload, and the dense-dump profile of the
+            # direct-write load pinned it as the dominant cost (~28 ms/param
+            # over ~3240 expert params per rank, ~5 of 6 samples) — the eight
+            # workers of one node share the memory bus, so a CPU memcpy runs
+            # at ~1/8 of its solo rate. The payloads go to the GPU anyway
+            # (the batched writer's foreach copy), so moving them once here
+            # and concatenating on-device (~0.2 ms) trades the contended CPU
+            # copy for two H2Ds and turns the writer's copy into a
+            # device-to-device one.
+            device = target._rowwise_data.device
+            gate_data = gate.data.to(device=device)
+            up_data = up.data.to(device=device)
+            return self._fp8_validate_pair(
+                torch.cat([gate_data, up_data], dim=0),
+                torch.cat([gate.scale_inv, up.scale_inv], dim=0),
+                megatron_module,
+                target=target,
+            )
+
+        if self.tp_rank == 0:
+            gate_data = _fp8_chunk(gate.data, self.tp_size, 0, self.megatron_param, "gate payload")
+            up_data = _fp8_chunk(up.data, self.tp_size, 0, self.megatron_param, "up payload")
+            gate_scale = _fp8_chunk(gate.scale_inv, self.tp_size, 0, self.megatron_param, "gate scale grid")
+            up_scale = _fp8_chunk(up.scale_inv, self.tp_size, 0, self.megatron_param, "up scale grid")
+            data_splits = [torch.cat([g, u], dim=0) for g, u in zip(gate_data, up_data, strict=True)]
+            scale_splits = [torch.cat([g, u], dim=0) for g, u in zip(gate_scale, up_scale, strict=True)]
+        else:
+            data_splits = None
+            scale_splits = None
+
+        # Normalize the payload to raw uint8 bytes before the collective:
+        # scatter_to_tp_ranks casts to the destination dtype, and a float8
+        # payload cast to uint8 would reinterpret the VALUES as bit patterns
+        # (silent byte corruption) rather than move them. The payload is
+        # already canonicalized at the record boundary; this re-normalizes
+        # defensively so the cast below is always a no-op on bytes.
+        data = self.scatter_to_tp_ranks(
+            [as_fp8_bytes(s) for s in data_splits] if data_splits else None,
+            tuple(target._rowwise_data.shape),
+            torch.uint8,
+            target._rowwise_data.device,
+        )
+        scale_inv = self.scatter_to_tp_ranks(
+            scale_splits,
+            tuple(target._rowwise_scale_inv.shape),
+            target._rowwise_scale_inv.dtype,
+            target._rowwise_scale_inv.device,
+        )
+        return self._fp8_validate_pair(data, scale_inv, megatron_module, target=target)
+
     def megatron_to_hf(
         self,
         megatron_weights: Optional[torch.Tensor],
@@ -3791,3 +4123,84 @@ def split_kv_weights(provider: TransformerConfig, kv: torch.Tensor) -> Tuple[tor
     k = kv_reshaped[k_slice].reshape(-1, hidden_size)
     v = kv_reshaped[v_slice].reshape(-1, hidden_size)
     return k, v
+
+
+class HCAlphaMapping(MegatronParamMapping):
+    """Map a 3-element HF hyper-connection scale tensor to/from Megatron's
+    three separate ``alpha_pre`` / ``alpha_post`` / ``alpha_res`` parameters.
+
+    The HF checkpoint stores the three scaling coefficients stacked along dim 0
+    as ``<layer>.hc_{kind}_scale`` (shape ``[3]``); Megatron keeps them as three
+    independent ``nn.Parameter([1])`` tensors on a single module.
+
+    One :class:`HCAlphaMapping` is registered **per alpha parameter** (index 0, 1,
+    or 2). Import extracts element ``[index:index+1]`` from the HF scale tensor.
+    Only the ``index == 0`` (``alpha_pre``) mapping exports: it gathers all three
+    alphas from the same module and concatenates them back into the ``[3]`` tensor.
+    The ``index != 0`` mappings return ``{}`` on export (the primary already wrote
+    all three), so they exist only to drive the import side and suppress export
+    "no mapping found" warnings.
+
+    This serves both models with a single wrapped ``hyper_connection`` submodule
+    (e.g. GLM-5.3-Flash) and models with separate ``self_attention_hyper_connection`` /
+    ``mlp_hyper_connection`` submodules (e.g. DeepSeek-V4); the caller chooses the
+    ``megatron_param`` path accordingly.
+    """
+
+    def __init__(self, megatron_param: str, hf_param: str, index: int):
+        super().__init__(megatron_param=megatron_param, hf_param=hf_param)
+        self._index = index
+        # index != 0 imports from the shared HF scale tensor but never exports
+        # (the index-0 mapping writes all three alphas). Its HF key collides with
+        # the index-0 key, so skip the strict hf_keys presence check.
+        self.allow_hf_name_mismatch = index != 0
+
+    def resolve(self, captures):
+        resolved_mg, resolved_hf = self._resolve_names(captures)
+        return HCAlphaMapping(resolved_mg, resolved_hf, self._index)
+
+    def hf_to_megatron(self, hf_weights, megatron_module):
+        attr = ("alpha_pre", "alpha_post", "alpha_res")[self._index]
+        return hf_weights[self._index : self._index + 1].to(getattr(megatron_module, attr).device)
+
+    def megatron_to_hf(self, megatron_weights, megatron_module):
+        if self._index != 0:
+            return {}
+        parts = []
+        for attr, weight in (
+            ("alpha_pre", megatron_weights),
+            ("alpha_post", getattr(megatron_module, "alpha_post", None)),
+            ("alpha_res", getattr(megatron_module, "alpha_res", None)),
+        ):
+            parts.append(self.broadcast_from_pp_rank(weight, cache_key=f"{self.hf_param}_{attr}"))
+        if parts[0] is None:
+            return {}
+        return {self.hf_param: torch.cat([self.maybe_dequantize(part).float() for part in parts])}
+
+
+class InitOnlyMapping(MegatronParamMapping[torch.Tensor]):
+    """Keep Megatron initialization for parameters that have no HF counterpart.
+
+    Used for hyper-connection / MTP parameters that MCore creates but the source
+    checkpoint does not store. The mapping declares a synthetic HF key ending in
+    ``__init_only__`` (which never exists in any checkpoint) and returns ``None``
+    on import so the random init is preserved. Export is a no-op.
+
+    Bridges that want this behaviour should also short-circuit the HF state-dict
+    lookup for the synthetic key (e.g. in ``maybe_modify_loaded_hf_weight``).
+    """
+
+    def __init__(self, megatron_param: str):
+        super().__init__(megatron_param=megatron_param, hf_param=megatron_param + ".__init_only__")
+        self.allow_hf_name_mismatch = True
+
+    def resolve(self, captures):
+        resolved_mg, _ = self._resolve_names(captures)
+        return InitOnlyMapping(resolved_mg)
+
+    def hf_to_megatron(self, hf_weights, megatron_module):
+        # hf_weights is None when the (synthetic) HF key is absent -> keep init.
+        return None
+
+    def megatron_to_hf(self, megatron_weights, megatron_module):
+        return {}

@@ -113,6 +113,21 @@ def is_split_gate_up_adapter(adapter: object) -> bool:
     return isinstance(adapter, SplitGateUpAdapter)
 
 
+def is_split_qkv_adapter(adapter: object) -> bool:
+    """Return True for a bridge SplitQKVAdapter (duck-typed, lazy import).
+
+    Split q/k/v adapters hold three independent rank-dim pairs on a fused
+    ``linear_qkv``; the export emits one conversion task per face. The import
+    stays lazy to avoid a module-level cycle between the PEFT layers and this
+    conversion module.
+    """
+    try:
+        from megatron.bridge.peft.utils import SplitQKVAdapter
+    except ImportError:
+        return False
+    return isinstance(adapter, SplitQKVAdapter)
+
+
 @dataclass(frozen=True)
 class AdapterWeightConversionTask:
     """Task describing an adapter's LoRA weights for conversion or merging."""
@@ -128,6 +143,11 @@ class AdapterWeightConversionTask:
     # the streaming loop filters the base HF names to this half's
     # projection (gate_proj / up_proj) instead of slicing a fused tensor.
     gate_up_half: Optional[str] = None
+    # Split q/k/v adapters (SplitQKVAdapter) emit one task per face; the
+    # streaming loop filters the base HF names to this face's projection
+    # (q_proj / k_proj / v_proj) instead of slicing the fused interleaved
+    # tensor.
+    qkv_face: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -387,10 +407,16 @@ class MegatronPeftBridge:
         """Split a fused LoRA linear_out tensor for QKV adapters."""
 
         model = megatron_model[0] if isinstance(megatron_model, list) else megatron_model
-        # Pass the LoRA rank as feature_dim so split_qkv_weights doesn't
-        # mistake it for an FP8 compressed hidden_size.
-        feature_dim = linear_out_weight.shape[-1] if linear_out_weight.ndim == 2 else None
-        q_out, k_out, v_out = split_qkv_weights(model.config, linear_out_weight, feature_dim=feature_dim)
+        config = model.config
+        if getattr(config, "kda_two_stage_gates", False):
+            # Low-rank KDA gates leave a contiguous Q/K/V-only input projection.
+            q_dim = config.linear_num_key_heads * config.linear_key_head_dim
+            v_dim = config.linear_num_value_heads * config.linear_value_head_dim
+            q_out, k_out, v_out = linear_out_weight.split((q_dim, q_dim, v_dim), dim=0)
+        else:
+            # LoRA rank is the feature width, not an FP8-compressed hidden size.
+            feature_dim = linear_out_weight.shape[-1] if linear_out_weight.ndim == 2 else None
+            q_out, k_out, v_out = split_qkv_weights(config, linear_out_weight, feature_dim=feature_dim)
         return {"q_proj": q_out, "k_proj": k_out, "v_proj": v_out}
 
     def _split_gdn_in_proj_linear_out_weight(
@@ -568,10 +594,11 @@ class MegatronPeftBridge:
 
     def _megatron_global_adapters_info_all_pp_ranks(
         self, megatron_model: Union[MegatronModel, List[MegatronModel]]
-    ) -> List[tuple[str, str, bool, bool, bool, int, int, int, int, bool]]:
+    ) -> List[tuple[str, str, bool, bool, bool, int, int, int, int, bool, bool]]:
         """Get all adapters' information tuple:
          (global_base_name, local_base_prefix, input_is_parallel, base_linear_is_parallel,
-          requires_expert_splits, alpha, dim, pp_rank, vp_stage, is_split_gate_up)
+          requires_expert_splits, alpha, dim, pp_rank, vp_stage, is_split_gate_up,
+          is_split_qkv)
         across all pipeline parallel ranks."""
         # Cache the result after first call
         if hasattr(self, "_cached_param_objects_adapter"):
@@ -585,7 +612,7 @@ class MegatronPeftBridge:
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         pp_rank = get_pg_rank(pp_group)
         model_config = unwrap_model(megatron_model)[0].config
-        global_param_objects: List[tuple[str, str, bool, bool, bool, int, int, int, int, bool]] = []
+        global_param_objects: List[tuple[str, str, bool, bool, bool, int, int, int, int, bool, bool]] = []
 
         for vp_stage, model in enumerate(megatron_model):
             for local_param_name, _ in itertools.chain(model.named_parameters(), persistent_buffers(model)):  # type: ignore[name-defined]
@@ -638,6 +665,7 @@ class MegatronPeftBridge:
                         pp_rank,
                         vp_stage,
                         is_split_gate_up_adapter(adapter),
+                        is_split_qkv_adapter(adapter),
                     )
                 )
 
@@ -713,6 +741,7 @@ class MegatronPeftBridge:
             pp_rank,
             vp_stage,
             is_split_gate_up,
+            is_split_qkv,
         ) in adapters_info:
             # global_base_name example: decoder.layers.0.mlp.linear_fc1.adapter.adapter_q
             global_base_prefix, _, adapter_suffix = global_base_name.partition(".adapter")
@@ -816,6 +845,76 @@ class MegatronPeftBridge:
                             param_weight=half_out_weight,
                         ),
                         gate_up_half=half,
+                    )
+                )
+                continue
+
+            if is_split_qkv:
+                # Split q/k/v adapter: three independent pairs, one per face of
+                # the fused ``linear_qkv`` output. Each pair is enumerated
+                # SEPARATELY by _megatron_global_adapters_info_all_pp_ranks
+                # (the dedup key is the pair's own ``linear_in.weight``), so
+                # this entry owns exactly ONE face — the q pair's parameter
+                # names are plain (the Q pair IS the adapter's inherited
+                # ``linear_in`` / ``linear_out``), the k / v pairs carry a
+                # ``.k`` / ``.v`` suffix. Emitting all three faces per entry
+                # would triple every split surface.
+                if base_linear_is_parallel:
+                    face_in_mapping_cls = RowParallelMapping if input_is_parallel else ColumnParallelMapping
+                    face_out_mapping_cls = ColumnParallelMapping
+                else:
+                    face_in_mapping_cls = ReplicatedMapping
+                    face_out_mapping_cls = ReplicatedMapping
+                face = "q" if adapter_suffix.strip(".") == "" else adapter_suffix.strip(".")
+                if face not in ("q", "k", "v"):
+                    raise ValueError(
+                        "split q/k/v adapter: unexpected face suffix "
+                        f"'{adapter_suffix}' on {global_base_name}"
+                    )
+                if adapter is not None:
+                    pair = adapter if face == "q" else getattr(adapter, face)
+                    face_in_module, face_out_module = pair.linear_in, pair.linear_out
+                    face_in_weight, face_out_weight = pair.linear_in.weight, pair.linear_out.weight
+                else:
+                    face_in_module, face_out_module = None, None
+                    face_in_weight, face_out_weight = None, None
+                face_tag = "" if face == "q" else f".{face}"
+                face_global_in = f"{global_linear_in_name}{face_tag}"
+                face_global_out = f"{global_linear_out_name}{face_tag}"
+                face_local_in = f"{local_linear_in_name}{face_tag}"
+                face_local_out = f"{local_linear_out_name}{face_tag}"
+                tasks_by_base[global_base_prefix].append(
+                    AdapterWeightConversionTask(
+                        global_base_prefix=global_base_prefix,
+                        adapter_key=adapter_key,
+                        alpha=alpha,
+                        dim=dim,
+                        requires_expert_splits=requires_expert_splits,
+                        linear_in_task=WeightConversionTask(
+                            param_name=face_local_in,
+                            global_param_name=face_global_in,
+                            mapping=face_in_mapping_cls(
+                                megatron_param=face_local_in,
+                                hf_param=hf_linear_in_name,
+                            ),
+                            pp_rank=pp_rank,
+                            vp_stage=vp_stage,
+                            megatron_module=face_in_module,
+                            param_weight=face_in_weight,
+                        ),
+                        linear_out_task=WeightConversionTask(
+                            param_name=face_local_out,
+                            global_param_name=face_global_out,
+                            mapping=face_out_mapping_cls(
+                                megatron_param=face_local_out,
+                                hf_param=hf_linear_out_name,
+                            ),
+                            pp_rank=pp_rank,
+                            vp_stage=vp_stage,
+                            megatron_module=face_out_module,
+                            param_weight=face_out_weight,
+                        ),
+                        qkv_face=face,
                     )
                 )
                 continue
@@ -1098,6 +1197,35 @@ class MegatronPeftBridge:
                             f"{adapter_task.global_base_prefix}, got {base_hf_weight_names}"
                         )
                     linear_in_hf_names, linear_out_hf_names = self._build_lora_hf_names(half_names)
+                    yield HFWeightTuple(linear_in_hf_names[0], current_linear_in_tensor)
+                    yield HFWeightTuple(linear_out_hf_names[0], current_linear_out_tensor)
+                    continue
+                if adapter_task.qkv_face is not None:
+                    # Split q/k/v adapter face: this task carries the face's OWN
+                    # pair, so no fused-tensor restructuring happens here. The
+                    # pair's ``linear_out`` already holds exactly that face's
+                    # rows in HF order (per-head contiguous), unlike the fused
+                    # single-adapter case whose interleaved rows would have to be
+                    # de-interleaved before export — the interleaving lives in
+                    # ``SplitQKVAdapter.forward`` / ``merged_weight`` only. What
+                    # is still needed is restricting the HF base name to this
+                    # face, because the registry maps the fused ``linear_qkv`` to
+                    # all three q/k/v names at once.
+                    #
+                    # TP needs no extra handling: megatron shards the interleaved
+                    # fused weight per query group, so rank r's q rows are exactly
+                    # the contiguous head block ``[r * heads/tp, (r+1) * heads/tp)``
+                    # of the q face, and ColumnParallelMapping concatenates the
+                    # per-rank shards in rank order.
+                    marker = f".{adapter_task.qkv_face}_proj."
+                    face_names = [name for name in base_hf_weight_names if marker in name]
+                    if len(face_names) != 1:
+                        raise ValueError(
+                            "split q/k/v adapter: expected exactly one "
+                            f"{adapter_task.qkv_face}_proj base for "
+                            f"{adapter_task.global_base_prefix}, got {base_hf_weight_names}"
+                        )
+                    linear_in_hf_names, linear_out_hf_names = self._build_lora_hf_names(face_names)
                     yield HFWeightTuple(linear_in_hf_names[0], current_linear_in_tensor)
                     yield HFWeightTuple(linear_out_hf_names[0], current_linear_out_tensor)
                     continue

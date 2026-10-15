@@ -131,6 +131,44 @@ class AdapterWrapper(nn.Module):
         self._adapter_enabled = True
         self._base_returns_tuple = True
 
+    # ------------------------------------------------------------------
+    # Base-linear attribute delegation.
+    #
+    # Megatron's model code reads and ASSIGNS attributes directly on the
+    # (possibly wrapped) output layer. ``GPTModel`` and ``HybridModel`` read
+    # ``self.output_layer.sequence_parallel``, set it False around their own
+    # sequence-parallel gather, and restore it to True afterwards; both also
+    # read ``self.output_layer.gather_output``. An ``nn.Module`` wrapper
+    # answers neither, so a LoRA-wrapped output layer raised
+    # ``AttributeError: 'LoRALinear' object has no attribute 'gather_output'``
+    # on the first forward (observed on GLM-5.3-Flash with the unembed
+    # surface enabled).
+    #
+    # Assignment is the reason these are explicit properties rather than a
+    # generic ``__getattr__`` fallback: a fallback would let
+    # ``wrapper.sequence_parallel = False`` land in the WRAPPER's instance
+    # dict while the wrapped linear keeps its old value, so the wrapper and
+    # the module that actually runs the gather would disagree — a silent
+    # divergence. A property setter writes through to the wrapped module, so
+    # both views stay one value. (``object.__setattr__`` honours data
+    # descriptors, which is the path ``nn.Module.__setattr__`` takes for
+    # non-parameter, non-module values such as these flags.)
+    # ------------------------------------------------------------------
+
+    @property
+    def sequence_parallel(self) -> bool:
+        """Sequence-parallel flag of the wrapped linear (read-through)."""
+        return self.to_wrap.sequence_parallel
+
+    @sequence_parallel.setter
+    def sequence_parallel(self, value: bool) -> None:
+        self.to_wrap.sequence_parallel = value
+
+    @property
+    def gather_output(self) -> bool:
+        """Gather-output flag of the wrapped linear (read-through)."""
+        return self.to_wrap.gather_output
+
     def enable_adapter_layers(self) -> None:
         """Enable the adapter layers, allowing them to contribute to the forward pass output."""
         self._adapter_enabled = True

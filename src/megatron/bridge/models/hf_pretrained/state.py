@@ -37,6 +37,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+
 def _issue_shard_readahead(file_path) -> None:
     """Pull a whole checkpoint shard into the page cache before reading it.
 
@@ -61,7 +62,6 @@ def _issue_shard_readahead(file_path) -> None:
         pass
     finally:
         os.close(fd)
-
 
 
 def _validate_safetensors_shard_filename(filename: object, *, tensor_key: str, index_file: Path) -> str:
@@ -635,26 +635,39 @@ class SafeTensorsStateSource(StateSource):
                     filename = key_to_filename_map[key]
                     file_to_keys_map[filename].append(key)
 
+            verified = getattr(self, "_verified_shard_paths", None)
+            if verified is None:
+                verified = self._verified_shard_paths = set()
             for filename, keys_in_file in file_to_keys_map.items():
                 file_path = self.path / filename
-                if file_path.exists():
-                    _issue_shard_readahead(file_path)
-                    for attempt in range(max_retries):
-                        with safe_open(file_path, framework="pt", device="cpu") as f:
-                            file_keys = set(f.keys())
-                            for key in keys_in_file:
-                                if key in file_keys and key not in loaded_tensors:
-                                    loaded_tensors[key] = f.get_tensor(key)
-                                    remaining_keys.discard(key)
-                        still_missing = [k for k in keys_in_file if k in remaining_keys]
-                        if not still_missing:
-                            break
-                        if attempt < max_retries - 1:
-                            logger.warning(
-                                f"Retry {attempt + 1}/{max_retries}: {len(still_missing)} keys "
-                                f"not found in {filename}, retrying after delay..."
-                            )
-                            time.sleep(1.0 * (attempt + 1))
+                # Cache the existence check per shard: on a FUSE/NAS mount a
+                # stat costs ~25-50 ms, and the lazy per-key load path calls
+                # load_tensors once per KEY (thousands of times per import) —
+                # re-statting the same shard per query was the py-spy-pinned
+                # hot spot of the first direct-write load. One stat per shard
+                # per load instead of one per query; a vanished shard after
+                # verification still fails the open loudly below.
+                if filename not in verified:
+                    if not file_path.exists():
+                        continue
+                    verified.add(filename)
+                _issue_shard_readahead(file_path)
+                for attempt in range(max_retries):
+                    with safe_open(file_path, framework="pt", device="cpu") as f:
+                        file_keys = set(f.keys())
+                        for key in keys_in_file:
+                            if key in file_keys and key not in loaded_tensors:
+                                loaded_tensors[key] = f.get_tensor(key)
+                                remaining_keys.discard(key)
+                    still_missing = [k for k in keys_in_file if k in remaining_keys]
+                    if not still_missing:
+                        break
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"Retry {attempt + 1}/{max_retries}: {len(still_missing)} keys "
+                            f"not found in {filename}, retrying after delay..."
+                        )
+                        time.sleep(1.0 * (attempt + 1))
 
         if remaining_keys:
             safetensor_files = file_glob(str(self.path / "*.safetensors"))
