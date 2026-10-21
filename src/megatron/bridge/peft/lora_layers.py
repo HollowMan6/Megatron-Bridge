@@ -24,6 +24,29 @@ from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
 from megatron.bridge.peft.lora_merge import LoRAMerge
 
 
+class _InplaceDeltaAdd(torch.autograd.Function):
+    """Add an adapter delta into a base tensor without cloning the base.
+
+    ``add``'s gradient is the identity on both branches, so the wrapper is
+    exact. ``mark_dirty`` declares the in-place write on the base tensor, which
+    lets the add run on a custom Function output (e.g. a grouped/fused linear
+    result) that autograd would otherwise reject as an illegal in-place write.
+    Only valid when the base is not a view — a view created inside a custom
+    Function cannot be marked dirty by this wrapper, so callers fall back to
+    cloning in that case.
+    """
+
+    @staticmethod
+    def forward(ctx, base: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+        ctx.mark_dirty(base)
+        base.add_(delta)
+        return base
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        return grad, grad
+
+
 class LoRALinear(AdapterWrapper):
     """An adapter wrapper that adds the output of the adapter to the output of the wrapped module.
 
@@ -111,9 +134,40 @@ class LoRALinear(AdapterWrapper):
         linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
         if not self._adapter_enabled:
             return linear_output if not self._base_returns_tuple else (linear_output, bias)
-        adapter_output = self.adapter_forward(self.adapter, layernorm_output.contiguous(), *args, **kwargs)
+        adapter_input = layernorm_output.contiguous()
+        adapter_param = next(self.adapter.parameters(), None)
+        if (
+            adapter_param is not None
+            and adapter_input.is_floating_point()
+            and adapter_input.dtype != adapter_param.dtype
+        ):
+            adapter_input = adapter_input.to(dtype=adapter_param.dtype)
+        adapter_output = self.adapter_forward(self.adapter, adapter_input, *args, **kwargs)
         adapter_output = adapter_output.reshape(linear_output.shape)
-        combined = linear_output + adapter_output
+        # Opt-in long-context relief: adding into the base output in place drops the
+        # third full-width buffer that the out-of-place add allocates (measured
+        # 1.06-4.57 GiB per adapted layer at long-context row counts). A view cannot
+        # be marked dirty inside a custom Function, so views keep the default path.
+        # The in-place form is only correct when ``linear_output`` is a fresh
+        # activation: nothing else may read the pre-add value, and no producer
+        # backward may have saved it. A view cannot be marked dirty at all, and a
+        # view into a larger buffer would alias memory this module does not own,
+        # so require both "not a view" and "own storage". A producer that *saved*
+        # its output is caught by autograd's version counter (it raises rather than
+        # returning wrong gradients), but an alias made outside autograd's view
+        # (``.data``, a custom op) would not be -- so this stays opt-in and is
+        # meant for a known producer (a TE grouped/fused linear), not as a general
+        # default. The default below is main's out-of-place add.
+        import os as _os_lora
+        owns_storage = (
+            linear_output._base is None
+            and linear_output.untyped_storage().nbytes()
+            == linear_output.numel() * linear_output.element_size()
+        )
+        if _os_lora.environ.get("MINT_LORA_NO_CLONE") == "1" and owns_storage:
+            combined = _InplaceDeltaAdd.apply(linear_output, adapter_output)
+        else:
+            combined = linear_output + adapter_output
         if not self._base_returns_tuple:
             return combined
         return combined, bias
