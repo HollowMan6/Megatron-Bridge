@@ -39,6 +39,24 @@ class LoRALinear(AdapterWrapper):
         if not self._adapter_enabled:
             return base_weight
 
+        # Pool-backed (batched, stateless) adapter. Under the 2026-09-18 pool/absorbed
+        # structure unification the multi-tenant delta lives in the engine-owned pool and is
+        # applied inside the absorbed MLA forward, so this surface has no merged weight to
+        # hand out: the adapter carries no Parameters at all and reading linear_in/linear_out
+        # below would raise AttributeError. The effective weight is the base weight, and the
+        # per-token delta is applied downstream (the K-side correction on the absorbed query,
+        # the V-side correction after the up_v_weight projection). Readers such as
+        # AbsorbedMLA._get_kv_up_weights() only ever read ``.weight``, so returning the base
+        # weight leaves them unchanged. The single-slot path below is untouched.
+        # Imported here rather than at module scope: importing
+        # megatron.bridge.peft.batched.lora runs that package's __init__ and pulls in the
+        # BGMV kernel module, which should not become an import-time dependency of every
+        # lora_layers consumer (peft.canonical_lora imports this module).
+        from megatron.bridge.peft.batched.lora import BatchedLoraAdapter
+
+        if isinstance(self.adapter, BatchedLoraAdapter):
+            return base_weight
+
         if hasattr(self.adapter, "merged_weight"):
             # Split gate/up adapters hold two pairs and merge each against its
             # own row slice of the fused base weight.
