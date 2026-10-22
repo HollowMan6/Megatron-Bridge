@@ -42,10 +42,14 @@ dispatches purely on tensor dtype, so the same code path handles both:
   Flash-Base / Pro /   FP8_E4M3 + F32  (...)     FP8_E4M3 + F32 (...)
   Pro-Base (raw)
 
-All scale tensors are 128x128 block-tile geometry (scale.shape[i] == ceil(weight.shape[i]/128))
-except the MXFP4 expert path, where scale is per-row over 32-element K-tiles.
-``maybe_modify_loaded_hf_weight`` flattens both F8_E8M0 and F32 scales to
-F32 via ``.to(torch.float32)`` and selects the tile expansion automatically.
+Dense/attention/shared-expert scale tensors are block-tile geometry on the grid
+the checkpoint declares in ``quantization_config.weight_block_size`` (a
+``[rows, cols]`` pair: ``[32, 32]`` for DeepSeek-V4.1, so
+``scale.shape[i] == ceil(weight.shape[i]/32)``; other releases ship
+``[128, 128]``), except the MXFP4 expert path, where scale is per-row over
+32-element K-tiles. ``maybe_modify_loaded_hf_weight`` reads that pair from the
+HF config, flattens both F8_E8M0 and F32 scales to F32 via
+``.to(torch.float32)`` and selects the tile expansion automatically.
 All weights are dequantised to bfloat16 during import.
 
 MoE router note: Hash-routing layers (layer_number <= moe_n_hash_layers)
@@ -61,7 +65,9 @@ Megatron-Core prerequisites:
   - Separate MTP e_proj / h_proj modules with hyper-connections
 """
 
-from typing import Dict, Mapping
+import logging
+from collections.abc import Mapping
+from typing import Dict
 
 import torch
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -81,6 +87,9 @@ from megatron.bridge.models.conversion.param_mapping import (
 )
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.mla_provider import MLAModelProvider
+
+
+logger = logging.getLogger(__name__)
 
 
 try:
@@ -161,6 +170,44 @@ def set_deepseek_v4_pipeline_model_parallel_layout(model_cfg: MLAModelProvider) 
         layout.append(stage)
 
     model_cfg.pipeline_model_parallel_layout = layout
+
+
+def _dsv4_config_field(config, name):
+    """Read one field from an HF config that is either attribute- or mapping-shaped."""
+    if config is None:
+        return None
+    if isinstance(config, Mapping):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def _dsv4_fp8_block_size(hf_config) -> tuple[int, str | None]:
+    """Return the FP8 weight block size the checkpoint was quantized on.
+
+    The tile edge comes from ``quantization_config.weight_block_size`` (a
+    ``[rows, cols]`` pair, ``[32, 32]`` for DeepSeek-V4.1). The dequantizer can
+    only express one square edge, so anything other than two equal positive
+    integers falls back to :data:`quantization_utils.FP8_BLOCK_SIZE` and returns
+    the reason for the caller to log — dequantizing a finely tiled checkpoint on
+    the default grid still satisfies the shape assert and would silently return
+    mis-scaled weights.
+    """
+    fallback = quantization_utils.FP8_BLOCK_SIZE
+    quantization_config = _dsv4_config_field(hf_config, "quantization_config")
+    weight_block_size = _dsv4_config_field(quantization_config, "weight_block_size")
+    if weight_block_size is None:
+        return fallback, "config has no quantization_config.weight_block_size"
+
+    if isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2:
+        rows, cols = weight_block_size
+        if rows == cols and isinstance(rows, int) and not isinstance(rows, bool) and rows > 0:
+            return int(rows), None
+
+    return (
+        fallback,
+        f"config quantization_config.weight_block_size={weight_block_size!r} "
+        "is not an equal, positive [rows, cols] pair",
+    )
 
 
 def _dsv4_num_hash_layers(hf_config) -> int:
@@ -491,18 +538,35 @@ class DeepSeekV4Bridge(MegatronModelBridge):
     ):
         """Dequantise quantized weights using their accompanying block-scale tensor.
 
-        V4 stores attention/embedding weights as float8_e4m3fn with 128x128-block
-        scales, and expert FFN weights as MXFP4 packed (I8, 2 nibbles/byte) with
-        F8_E8M0 per-32-element scales.  For dict hf_param (GatedMLPMapping etc.),
-        dequantizes each key independently so expert gate/up weights are handled.
-        Optional CSA indexer weights may use the legacy flat name or the native
-        Transformers scorer submodule name.
+        V4 stores dense, attention and shared-expert weights as float8_e4m3fn with
+        one scale per block tile of the grid the checkpoint declares in
+        ``quantization_config.weight_block_size`` (a ``[rows, cols]`` pair:
+        ``[32, 32]`` for DeepSeek-V4.1, ``[128, 128]`` for the earlier releases),
+        and routed expert FFN weights as MXFP4 packed (I8, 2 nibbles/byte) with
+        F8_E8M0 per-32-element scales.  The tile edge is read from that config key
+        on every call, falling back to ``FP8_BLOCK_SIZE`` with a one-line warning
+        when it is absent or not an equal, positive pair — dequantizing on a
+        coarser grid than the checkpoint was quantized on still passes the shape
+        assert and silently mis-scales the weights.  For dict hf_param
+        (GatedMLPMapping etc.), dequantizes each key independently so expert
+        gate/up weights are handled.  Optional CSA indexer weights may use the
+        legacy flat name or the native Transformers scorer submodule name.
         """
+        block_size, fallback_reason = _dsv4_fp8_block_size(self.hf_config)
+        if fallback_reason is not None and not getattr(self, "_dsv4_fp8_block_size_warned", False):
+            self._dsv4_fp8_block_size_warned = True
+            logger.warning(
+                "DeepSeek-V4 FP8 import: %s; dequantizing dense/attention/shared-expert weights on the "
+                "default %dx%d block grid.",
+                fallback_reason,
+                block_size,
+                block_size,
+            )
         if isinstance(hf_param, str) and hf_param not in hf_state_dict:
             legacy_param = hf_param.replace(".indexer.scorer.weights_proj.", ".indexer.weights_proj.")
             if legacy_param in hf_state_dict:
                 hf_param = legacy_param
-        return quantization_utils.maybe_dequantize_hf_quantized_weight(hf_param, hf_state_dict)
+        return quantization_utils.maybe_dequantize_hf_quantized_weight(hf_param, hf_state_dict, block_size=block_size)
 
     # ------------------------------------------------------------------
     # Weight mapping registry

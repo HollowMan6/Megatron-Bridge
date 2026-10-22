@@ -18,6 +18,7 @@ Locks in the MTP mapping layout: per-MTP-layer HC head, separate ``e_proj``
 and ``h_proj`` mappings, and no deprecated concatenated ``eh_proj`` path.
 """
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -30,6 +31,7 @@ from megatron.bridge.models.conversion.param_mapping import AutoMapping, Replica
 from megatron.bridge.models.deepseek.deepseek_v4_bridge import (
     DeepSeekV4Bridge,
     _dsv4_compress_ratios,
+    _dsv4_fp8_block_size,
     _dsv4_num_hash_layers,
 )
 
@@ -565,3 +567,164 @@ class TestDeepSeekV4ExportWeightDtype:
         out = bridge.maybe_modify_converted_hf_weight(task, {"a.weight": torch.ones(1)}, {})
 
         assert called.get("hit") and "quantized" in out
+
+
+# DeepSeek-V4.1's on-disk geometry: float8_e4m3fn weights with one scale per
+# 32x32 block, so a 64x64 weight carries a 2x2 scale grid. Payload quadrants
+# (1, 2, 3, 4) times scale quadrants (1, 2, 4, 8) are the dequantized quadrants
+# (1, 4, 12, 32); all four products are exact in bfloat16. On the 128 default the
+# grid collapses to scale[0, 0] == 1.0, so the same tensors dequantize to the raw
+# payload (1, 2, 3, 4) instead.
+_V4_BLOCK32_PAYLOAD = [[1.0, 2.0], [3.0, 4.0]]
+_V4_BLOCK32_SCALE = [[1.0, 2.0], [4.0, 8.0]]
+_V4_BLOCK32_DEQUANTIZED_CORNERS = (1.0, 4.0, 12.0, 32.0)
+_V4_FALLBACK_DEQUANTIZED_CORNERS = (1.0, 2.0, 3.0, 4.0)
+_MISSING_QUANTIZATION_CONFIG = object()
+
+
+def _v4_block32_state_dict(weight_key="layers.0.attn.wkv.weight"):
+    """HF state dict holding a 32-block FP8 weight and its sibling scale."""
+    payload = torch.ones((2, 32, 2, 32), dtype=torch.float8_e4m3fn)
+    for row_block in range(2):
+        for col_block in range(2):
+            payload[row_block, :, col_block, :] = _V4_BLOCK32_PAYLOAD[row_block][col_block]
+    return {
+        weight_key: payload.reshape(64, 64),
+        weight_key[: -len(".weight")] + ".scale": torch.tensor(_V4_BLOCK32_SCALE, dtype=torch.float32),
+    }
+
+
+def _v4_bridge_with_quantization_config(quantization_config=_MISSING_QUANTIZATION_CONFIG):
+    """A DSv4 bridge whose hf_config carries (or omits) quantization_config."""
+    bridge = DeepSeekV4Bridge()
+    hf_config = SimpleNamespace()
+    if quantization_config is not _MISSING_QUANTIZATION_CONFIG:
+        hf_config.quantization_config = quantization_config
+    bridge.hf_config = hf_config
+    return bridge
+
+
+def _v4_quadrant_corners(tensor):
+    """Top-left, top-right, bottom-left and bottom-right 32x32-block values."""
+    return (
+        float(tensor[0, 0]),
+        float(tensor[0, 32]),
+        float(tensor[32, 0]),
+        float(tensor[32, 32]),
+    )
+
+
+class TestDeepSeekV4Fp8BlockSize:
+    """The FP8 import tile edge must follow the checkpoint config, not the 128 default."""
+
+    def test_reader_accepts_a_square_pair_and_rejects_everything_else(self):
+        square = SimpleNamespace(quantization_config={"weight_block_size": [32, 32]})
+        assert _dsv4_fp8_block_size(square) == (32, None)
+        assert _dsv4_fp8_block_size({"quantization_config": {"weight_block_size": [128, 128]}}) == (128, None)
+
+        non_square = SimpleNamespace(quantization_config={"weight_block_size": [128, 32]})
+        block_size, reason = _dsv4_fp8_block_size(non_square)
+        assert block_size == quantization_utils.FP8_BLOCK_SIZE
+        assert "weight_block_size=[128, 32]" in reason
+
+        block_size, reason = _dsv4_fp8_block_size(SimpleNamespace(quantization_config={}))
+        assert block_size == quantization_utils.FP8_BLOCK_SIZE
+        assert "quantization_config.weight_block_size" in reason
+
+    @pytest.mark.parametrize(
+        ("quantization_config", "expected"),
+        [
+            pytest.param({"weight_block_size": [32, 32]}, 32, id="v41-32"),
+            pytest.param({"weight_block_size": [128, 128]}, 128, id="legacy-128"),
+            pytest.param({"weight_block_size": [64, 64]}, 64, id="other-square"),
+            pytest.param({"weight_block_size": [128, 32]}, quantization_utils.FP8_BLOCK_SIZE, id="non-square"),
+            pytest.param({"weight_block_size": [32]}, quantization_utils.FP8_BLOCK_SIZE, id="one-element"),
+            pytest.param({"weight_block_size": [32, 32, 32]}, quantization_utils.FP8_BLOCK_SIZE, id="three-elements"),
+            pytest.param({"weight_block_size": [0, 0]}, quantization_utils.FP8_BLOCK_SIZE, id="zero-edge"),
+            pytest.param({"weight_block_size": ["32", "32"]}, quantization_utils.FP8_BLOCK_SIZE, id="string-edges"),
+            pytest.param({"weight_block_size": None}, quantization_utils.FP8_BLOCK_SIZE, id="null-block-size"),
+            pytest.param({}, quantization_utils.FP8_BLOCK_SIZE, id="config-without-block-size"),
+            pytest.param(None, quantization_utils.FP8_BLOCK_SIZE, id="null-quantization-config"),
+            pytest.param(
+                _MISSING_QUANTIZATION_CONFIG,
+                quantization_utils.FP8_BLOCK_SIZE,
+                id="hf-config-without-quantization-config",
+            ),
+        ],
+    )
+    def test_forwards_the_config_block_size_to_the_dequantizer(self, quantization_config, expected):
+        bridge = _v4_bridge_with_quantization_config(quantization_config)
+        recorded = {}
+
+        def record_block_size(hf_param, hf_state_dict, **kwargs):
+            recorded.update(kwargs)
+            return torch.zeros(1)
+
+        with patch.object(quantization_utils, "maybe_dequantize_hf_quantized_weight", side_effect=record_block_size):
+            bridge.maybe_modify_loaded_hf_weight("layers.0.attn.wkv.weight", _v4_block32_state_dict())
+
+        assert recorded["block_size"] == expected
+
+    @pytest.mark.parametrize(
+        ("weight_block_size", "expected_corners"),
+        [
+            pytest.param([32, 32], _V4_BLOCK32_DEQUANTIZED_CORNERS, id="32-block-grid"),
+            pytest.param([128, 128], _V4_FALLBACK_DEQUANTIZED_CORNERS, id="128-block-grid"),
+        ],
+    )
+    def test_config_block_size_decides_the_dequantized_values(self, weight_block_size, expected_corners):
+        """End to end: the config, not the default, picks the scale grid that is applied."""
+        bridge = _v4_bridge_with_quantization_config({"weight_block_size": weight_block_size})
+
+        out = bridge.maybe_modify_loaded_hf_weight("layers.0.attn.wkv.weight", _v4_block32_state_dict())
+
+        assert _v4_quadrant_corners(out) == expected_corners
+
+    def test_dict_hf_param_threads_the_same_block_size(self):
+        """GatedMLPMapping passes a dict; the config edge must reach every key."""
+        bridge = _v4_bridge_with_quantization_config({"weight_block_size": [32, 32]})
+        state = {
+            **_v4_block32_state_dict("layers.0.ffn.experts.0.w1.weight"),
+            **_v4_block32_state_dict("layers.0.ffn.experts.0.w3.weight"),
+        }
+
+        out = bridge.maybe_modify_loaded_hf_weight(
+            {
+                "gate": "layers.0.ffn.experts.0.w1.weight",
+                "up": "layers.0.ffn.experts.0.w3.weight",
+            },
+            state,
+        )
+
+        assert set(out) == {"gate", "up"}
+        assert _v4_quadrant_corners(out["gate"]) == _V4_BLOCK32_DEQUANTIZED_CORNERS
+        assert _v4_quadrant_corners(out["up"]) == _V4_BLOCK32_DEQUANTIZED_CORNERS
+
+    @pytest.mark.parametrize(
+        "quantization_config",
+        [
+            pytest.param({}, id="missing-block-size"),
+            pytest.param({"weight_block_size": [128, 32]}, id="non-square"),
+        ],
+    )
+    def test_unusable_block_size_warns_once_and_falls_back(self, quantization_config, caplog):
+        bridge = _v4_bridge_with_quantization_config(quantization_config)
+        state = _v4_block32_state_dict()
+        caplog.set_level(logging.WARNING)
+
+        first = bridge.maybe_modify_loaded_hf_weight("layers.0.attn.wkv.weight", state)
+        second = bridge.maybe_modify_loaded_hf_weight("layers.0.attn.wkv.weight", state)
+
+        fallback_warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == DeepSeekV4Bridge.__module__ and record.levelno >= logging.WARNING
+        ]
+        assert len(fallback_warnings) == 1, fallback_warnings
+        assert "weight_block_size" in fallback_warnings[0]
+        fallback_grid = f"{quantization_utils.FP8_BLOCK_SIZE}x{quantization_utils.FP8_BLOCK_SIZE}"
+        assert f"default {fallback_grid}" in fallback_warnings[0]
+        # The fallback still dequantizes (on the wrong, coarser grid): the values
+        # differ from the true 32-block quadrants, which is the whole point of the warning.
+        assert _v4_quadrant_corners(first) == _V4_FALLBACK_DEQUANTIZED_CORNERS
+        assert _v4_quadrant_corners(second) == _V4_FALLBACK_DEQUANTIZED_CORNERS

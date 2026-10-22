@@ -325,3 +325,92 @@ def test_quantize_dequantize_int4_preserves_shape_and_dtype():
     assert shape.tolist() == [1, 32]
     assert result.shape == weight.shape
     assert result.dtype == torch.bfloat16
+
+
+# A 64x64 float8_e4m3fn weight whose scales are a genuine 2x2 grid of 32x32
+# blocks -- the DeepSeek-V4.1 geometry (``weight_block_size: [32, 32]``), which a
+# 128x128 default cannot describe. Both grids are asymmetric on purpose, so a
+# transposed expansion changes the quadrant values too. Every product of a
+# payload entry and a scale entry is exact in bfloat16.
+_BLOCK32_PAYLOAD_QUADRANTS = [[1.0, 2.0], [3.0, 4.0]]
+_BLOCK32_SCALE_QUADRANTS = [[1.0, 2.0], [4.0, 8.0]]
+_BLOCK32_DEQUANTIZED_QUADRANTS = [[1.0, 4.0], [12.0, 32.0]]
+
+
+def _block32_fp8_weight_and_scale():
+    """Build a 64x64 FP8 weight plus the 2x2 scale grid of its 32x32 blocks."""
+    payload = torch.ones((2, 32, 2, 32), dtype=torch.float8_e4m3fn)
+    for row_block in range(2):
+        for col_block in range(2):
+            payload[row_block, :, col_block, :] = _BLOCK32_PAYLOAD_QUADRANTS[row_block][col_block]
+    return payload.reshape(64, 64), torch.tensor(_BLOCK32_SCALE_QUADRANTS, dtype=torch.float32)
+
+
+def _quadrant_values(tensor, block_size=32):
+    """Return the single value held by each ``block_size``-square tile."""
+    quadrants = []
+    for row_block in range(tensor.shape[0] // block_size):
+        row = []
+        for col_block in range(tensor.shape[1] // block_size):
+            tile = tensor[
+                row_block * block_size : (row_block + 1) * block_size,
+                col_block * block_size : (col_block + 1) * block_size,
+            ]
+            uniques = tile.float().unique()
+            assert uniques.numel() == 1, f"tile ({row_block}, {col_block}) is not constant: {uniques.tolist()}"
+            row.append(float(uniques.item()))
+        quadrants.append(row)
+    return quadrants
+
+
+def test_dequantize_fp8_e4m3fn_with_scale_honours_the_checkpoint_block_grid():
+    """A 32-block checkpoint must be dequantized on its own grid, not on the 128 default."""
+    weight, scale = _block32_fp8_weight_and_scale()
+
+    exact = dequantize_fp8_e4m3fn_with_scale(weight, scale, block_size=32)
+
+    assert _quadrant_values(exact) == _BLOCK32_DEQUANTIZED_QUADRANTS
+
+    # The FP8_BLOCK_SIZE default still satisfies the dequant shape assert: the
+    # 2x2 grid is repeat_interleaved by 128 and sliced back to 64, which keeps
+    # only scale[0, 0], so the whole weight comes back as payload * 1.0.
+    default = dequantize_fp8_e4m3fn_with_scale(weight, scale)
+
+    assert _quadrant_values(default) == _BLOCK32_PAYLOAD_QUADRANTS
+    assert not torch.equal(default, exact)
+
+
+def test_maybe_dequantize_hf_quantized_weight_threads_block_size_to_fp8_dequant():
+    weight, scale = _block32_fp8_weight_and_scale()
+    hf_state_dict = {
+        "layers.0.attn.wkv.weight": weight,
+        "layers.0.attn.wkv.scale": scale,
+    }
+
+    exact = maybe_dequantize_hf_quantized_weight("layers.0.attn.wkv.weight", hf_state_dict, block_size=32)
+
+    assert _quadrant_values(exact) == _BLOCK32_DEQUANTIZED_QUADRANTS
+
+    # The keyword defaults to the 128 grid, so every pre-existing caller keeps its
+    # current behaviour -- and that behaviour is visibly wrong for this checkpoint.
+    default = maybe_dequantize_hf_quantized_weight("layers.0.attn.wkv.weight", hf_state_dict)
+    assert _quadrant_values(default) == _BLOCK32_PAYLOAD_QUADRANTS
+
+    # dict hf_param (GatedMLPMapping) threads the same edge through the recursion.
+    as_dict = maybe_dequantize_hf_quantized_weight({"gate": "layers.0.attn.wkv.weight"}, hf_state_dict, block_size=32)
+    assert _quadrant_values(as_dict["gate"]) == _BLOCK32_DEQUANTIZED_QUADRANTS
+
+
+def test_block_size_leaves_the_mxfp4_branch_alone():
+    """MXFP4 expert scales are per-row over 32-element K tiles, not block tiles."""
+    hf_state_dict = {
+        "layers.0.ffn.experts.0.w1.weight": torch.zeros(1, 16, dtype=torch.int8),
+        "layers.0.ffn.experts.0.w1.scale": torch.ones(1, 1),
+    }
+
+    default = maybe_dequantize_hf_quantized_weight("layers.0.ffn.experts.0.w1.weight", hf_state_dict)
+    with_block_size = maybe_dequantize_hf_quantized_weight(
+        "layers.0.ffn.experts.0.w1.weight", hf_state_dict, block_size=32
+    )
+
+    assert torch.equal(default, with_block_size)

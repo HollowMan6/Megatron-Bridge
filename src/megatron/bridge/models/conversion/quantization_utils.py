@@ -423,6 +423,9 @@ def dequantize_fp8_e4m3fn_with_scale(
 
     Supports three common HF checkpoint scale layouts:
     1-D per-row or row-block scales, 2-D per-row K tiles, and 2-D block scales.
+    ``block_size`` is the edge of the block-scale tile and must match the grid the
+    checkpoint declared (``quantization_config.weight_block_size``), not this
+    module's default.
     """
     weight_f32 = weight.to(torch.float32)
     scale_f32 = scale.to(torch.float32)
@@ -719,10 +722,24 @@ def maybe_dequantize_hf_quantized_weight(
     hf_state_dict: Mapping[str, torch.Tensor],
     *,
     dtype: torch.dtype = torch.bfloat16,
+    block_size: int = FP8_BLOCK_SIZE,
 ) -> torch.Tensor | dict[str, torch.Tensor]:
-    """Load and dequantize HF ``*.weight`` tensors that carry sibling ``*.scale`` tensors."""
+    """Load and dequantize HF ``*.weight`` tensors that carry sibling ``*.scale`` tensors.
+
+    ``block_size`` is the edge of the checkpoint's FP8 scale tile — the value its
+    ``quantization_config.weight_block_size`` declares — and is forwarded to
+    :func:`dequantize_fp8_e4m3fn_with_scale`. The default is the 128x128 grid used
+    by DeepSeek-V3 / MiniMax-M2; a checkpoint quantized on a finer grid must pass
+    its own edge, because the wrong edge still satisfies the dequant shape assert
+    (the scale grid is repeated and then sliced) and silently returns mis-scaled
+    values. The int8/MXFP4 branch ignores ``block_size``: those scales are
+    per-row over 32-element K tiles.
+    """
     if isinstance(hf_param, dict):
-        return {k: maybe_dequantize_hf_quantized_weight(v, hf_state_dict, dtype=dtype) for k, v in hf_param.items()}
+        return {
+            k: maybe_dequantize_hf_quantized_weight(v, hf_state_dict, dtype=dtype, block_size=block_size)
+            for k, v in hf_param.items()
+        }
 
     weight = hf_state_dict[hf_param]
 
@@ -742,7 +759,9 @@ def maybe_dequantize_hf_quantized_weight(
     if scale_key not in hf_state_dict:
         return weight.to(dtype)
 
-    return dequantize_fp8_e4m3fn_with_scale(weight, hf_state_dict[scale_key], name=hf_param, dtype=dtype)
+    return dequantize_fp8_e4m3fn_with_scale(
+        weight, hf_state_dict[scale_key], name=hf_param, block_size=block_size, dtype=dtype
+    )
 
 
 def requantize_hf_weight_scale_pairs(
