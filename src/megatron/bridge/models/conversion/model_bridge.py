@@ -52,7 +52,7 @@ from torch.distributed._tensor import DTensor
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
-from megatron.bridge.models.conversion import quantization_utils
+from megatron.bridge.models.conversion import load_profile, quantization_utils
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.param_mapping import (
     MegatronParamMapping,
@@ -1281,6 +1281,7 @@ class MegatronModelBridge(
 
         return merged_result or None
 
+    @load_profile.profiled_load
     def load_weights_hf_to_megatron(
         self,
         hf_pretrained: HFPreTrained,
@@ -1288,6 +1289,10 @@ class MegatronModelBridge(
         allowed_mismatched_params: Optional[List[str]] = None,
     ) -> List[MegatronModel]:
         """Load HuggingFace weights into Megatron models.
+
+        The decorator opens the opt-in timing window (``MINT_LOAD_PROFILE``) for
+        the whole load. While profiling is off it calls straight through and the
+        per-parameter ``load_profile.phase`` calls below are no-ops.
 
         This method orchestrates the complete weight loading process from HuggingFace
         format to Megatron's distributed format. It builds a conversion task and
@@ -1413,6 +1418,7 @@ class MegatronModelBridge(
             # None means megatron module not on current rank, skip if this task is not going to happen
             if task.megatron_module is None:
                 continue
+            load_profile.count_param()
 
             # 0) Direct blockwise-FP8 write: carry the checkpoint's payload and its
             # `_scale_inv` through the same mapping and install them in the TE parameter
@@ -1421,7 +1427,8 @@ class MegatronModelBridge(
             # read once here and once by the legacy fetch below; that is a handful of
             # tensors (lm_head, vision tower, kv_b_proj) against 37k FP8 ones.
             if fp8_direct_write:
-                hf_fp8 = self.maybe_load_fp8_direct_weight(task.mapping, task.param_weight, hf_state_dict)
+                with load_profile.phase("read"):
+                    hf_fp8 = self.maybe_load_fp8_direct_weight(task.mapping, task.param_weight, hf_state_dict)
                 if hf_fp8 is not None:
                     assert task.param_weight is not None, "param_weight is required for HF->Megatron conversion"
                     # no_grad: the param storages are leaf tensors with
@@ -1429,35 +1436,44 @@ class MegatronModelBridge(
                     # copy_ below runs under no_grad for exactly this
                     # reason; the attribute writes here must too.
                     with torch.no_grad():
-                        rowwise_data, rowwise_scale_inv = task.mapping.hf_to_megatron_fp8(hf_fp8, task.megatron_module)
+                        with load_profile.phase("map"):
+                            rowwise_data, rowwise_scale_inv = task.mapping.hf_to_megatron_fp8(
+                                hf_fp8, task.megatron_module
+                            )
                         _pending_fp8_writes.append(
                             (task.param_weight, rowwise_data, rowwise_scale_inv, task.param_name)
                         )
                         if len(_pending_fp8_writes) >= _write_batch_size:
-                            quantization_utils.write_blockwise_fp8_params_batch(_pending_fp8_writes)
+                            with load_profile.phase("copy"):
+                                quantization_utils.write_blockwise_fp8_params_batch(_pending_fp8_writes)
                             _pending_fp8_writes.clear()
                     continue
 
             # 1) Fetch source tensor(s) from HF state dict, with caching for grouped mappings
-            hf_param_key = str(task.mapping.hf_param)
-            is_grouped = getattr(task.mapping, "is_grouped_export", False)
-            if is_grouped and hf_param_key in _hf_import_cache:
-                hf_weights = _hf_import_cache[hf_param_key]
-            else:
-                hf_weights = self.maybe_modify_loaded_hf_weight(task.mapping.hf_param, hf_state_dict)
-                if is_grouped:
-                    _hf_import_cache[hf_param_key] = hf_weights
+            # `dequant` excludes the nested `read` frames, so an in-memory read
+            # contributes to `read` and the actual dequantization to `dequant`.
+            with load_profile.phase("dequant"):
+                hf_param_key = str(task.mapping.hf_param)
+                is_grouped = getattr(task.mapping, "is_grouped_export", False)
+                if is_grouped and hf_param_key in _hf_import_cache:
+                    hf_weights = _hf_import_cache[hf_param_key]
+                else:
+                    hf_weights = self.maybe_modify_loaded_hf_weight(task.mapping.hf_param, hf_state_dict)
+                    if is_grouped:
+                        _hf_import_cache[hf_param_key] = hf_weights
 
             # 2) Delegate conversion & distribution to the bridge
-            converted_weights = task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
+            with load_profile.phase("map"):
+                converted_weights = task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
 
             # 3) Copy into Megatron param if this rank received a shard
             if converted_weights is not None:
                 # Assert that param_weight is not None for HF->Megatron tasks
                 assert task.param_weight is not None, "param_weight is required for HF->Megatron conversion"
                 if isinstance(task.param_weight, DTensor):
-                    sliced_converted_weights = converted_weights.reshape(-1)[task.param_weight.megatron_fsdp_slice]
-                    task.param_weight._local_tensor.reshape(-1).copy_(sliced_converted_weights)
+                    with load_profile.phase("copy"):
+                        sliced_converted_weights = converted_weights.reshape(-1)[task.param_weight.megatron_fsdp_slice]
+                        task.param_weight._local_tensor.reshape(-1).copy_(sliced_converted_weights)
                     continue
 
                 # Check shape compatibility before copying
@@ -1495,7 +1511,8 @@ class MegatronModelBridge(
                 # In-place updates under grad mode will raise:
                 # "a leaf Variable that requires grad is being used in an in-place operation."
                 with torch.no_grad():
-                    task.param_weight.copy_(converted_weights)
+                    with load_profile.phase("copy"):
+                        task.param_weight.copy_(converted_weights)
         self._broadcast_shared_embeddings(megatron_model)
         if use_megatron_fsdp:
             for m in original_megatron_model:
@@ -1509,7 +1526,8 @@ class MegatronModelBridge(
                 self.unquantized_state_dict = captured_state_dicts
         if _pending_fp8_writes:
             with torch.no_grad():
-                quantization_utils.write_blockwise_fp8_params_batch(_pending_fp8_writes)
+                with load_profile.phase("copy"):
+                    quantization_utils.write_blockwise_fp8_params_batch(_pending_fp8_writes)
         return megatron_model
 
     def stream_weights_hf_to_megatron(

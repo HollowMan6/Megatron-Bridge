@@ -37,6 +37,21 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Resolved on first use rather than at import: the profiler lives in the sibling
+# ``conversion`` package, which reaches this module through
+# ``hf_pretrained.base`` while still initialising.
+_LOAD_PROFILE = None
+
+
+def _load_profile():
+    """Return the opt-in load profiler (see ``conversion/load_profile.py``)."""
+    global _LOAD_PROFILE
+    if _LOAD_PROFILE is None:
+        from megatron.bridge.models.conversion import load_profile
+
+        _LOAD_PROFILE = load_profile
+    return _LOAD_PROFILE
+
 
 def _issue_shard_readahead(file_path) -> None:
     """Pull a whole checkpoint shard into the page cache before reading it.
@@ -204,7 +219,14 @@ class StateDict(Mapping[str, torch.Tensor]):
         """
         Load specified tensors from the underlying source.
         """
-        return self.source.load_tensors(keys_to_load)
+        # Every lazy read funnels through here, so this is where the load
+        # profiler's ``read`` phase is measured. A strict no-op (no clock read,
+        # no counter touched) unless MINT_LOAD_PROFILE is set.
+        profiler = _load_profile()
+        with profiler.phase("read"):
+            tensors = self.source.load_tensors(keys_to_load)
+        profiler.add_read_tensors(tensors)
+        return tensors
 
     def _match_keys(self, pattern: Union[str, Pattern]) -> List[str]:
         """Match keys against a glob pattern or regex."""

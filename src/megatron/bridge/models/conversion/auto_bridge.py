@@ -41,7 +41,7 @@ from transformers.configuration_utils import PretrainedConfig
 from typing_extensions import Unpack
 
 from megatron.bridge.models._deprecation import warn_if_deprecated_model, warn_if_legacy_nemotron_path
-from megatron.bridge.models.conversion import model_bridge
+from megatron.bridge.models.conversion import load_profile, model_bridge
 from megatron.bridge.models.conversion.model_bridge import (
     HFWeightTuple,
     MegatronModelBridge,
@@ -696,7 +696,11 @@ class AutoBridge(Generic[MegatronModelT]):
             wrapper_cls = self._pretrained_wrapper_cls
             pre_trained = wrapper_cls.from_pretrained(hf_path, trust_remote_code=trust_remote_code)
         bridge = self._model_bridge
-        bridge.load_weights_hf_to_megatron(pre_trained, model, allowed_mismatched_params=allowed_mismatched_params)
+        # Opt-in phase timing (MINT_LOAD_PROFILE): one LOAD_PROFILE line per rank
+        # when the load finishes. A strict pass-through when the variable is unset,
+        # and re-entrant with the driver's own scope so the line is printed once.
+        with load_profile.load_scope():
+            bridge.load_weights_hf_to_megatron(pre_trained, model, allowed_mismatched_params=allowed_mismatched_params)
         # Get unquantized_state_dict from the bridge instance that was used for optimizer reload
         self.unquantized_state_dict = getattr(bridge, "unquantized_state_dict", None)
         return model
