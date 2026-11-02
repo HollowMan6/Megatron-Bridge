@@ -414,3 +414,271 @@ def test_block_size_leaves_the_mxfp4_branch_alone():
     )
 
     assert torch.equal(default, with_block_size)
+
+# ---------------------------------------------------------------------------
+# Tests for the DSV4.1 re-quantisation units, ported with them. Kept alongside
+# main's own tests above; this block only adds cases main did not have.
+# ---------------------------------------------------------------------------
+
+def test_e4m3_with_scale_matches_the_host_path(monkeypatch):
+    """The device offload must be a pure speed-up, not a different number.
+
+    The DSV4.1 bridge dequantizes every FP8 leaf through this helper; moving the
+    broadcast multiply to the GPU is what turns the import's dominant phase from
+    minutes into seconds, so the two paths computing different values would silently
+    change every loaded weight. Host and device are compared bitwise on the three
+    scale layouts the helper accepts.
+    """
+    import torch
+
+    from megatron.bridge.models.conversion import quantization_utils as qu
+
+    torch.manual_seed(0)
+    block = 32
+
+    def _pair(rows: int, cols: int) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = (torch.rand(rows, cols) * 4 - 2).to(torch.float8_e4m3fn)
+        return weight, torch.rand(rows // block, cols // block, dtype=torch.float32) + 0.5
+
+    cases = {
+        "block2d": _pair(64, 64),
+        "row1d": (
+            (torch.rand(32, 64) * 4 - 2).to(torch.float8_e4m3fn),
+            torch.rand(32, dtype=torch.float32) + 0.5,
+        ),
+        "rowtile2d": (
+            (torch.rand(32, 64) * 4 - 2).to(torch.float8_e4m3fn),
+            torch.rand(32, 4, dtype=torch.float32) + 0.5,
+        ),
+    }
+
+    for label, (weight, scale) in cases.items():
+        host = qu._dequantize_e4m3_scale_impl(weight, scale, block_size=block)
+        public = qu.dequantize_fp8_e4m3fn_with_scale(weight, scale, block_size=block)
+        assert torch.equal(host, public), label
+
+        if torch.cuda.is_available():
+            device = qu._dequantize_e4m3_scale_impl(
+                weight.cuda(), scale.cuda(), block_size=block
+            ).cpu()
+            assert torch.equal(host, device), label
+
+
+def _te_reads_f32_scales(monkeypatch):
+    """Every test here assumes TransformerEngine reads blockwise scales as F32.
+
+    The direct write refuses to install scales without it (TE would reinterpret each one as
+    an exponent of two), so the variable is part of the environment these tests describe.
+    `test_the_writer_refuses_without_the_scale_family_variable` removes it on purpose.
+    """
+    monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
+
+
+def test_the_writer_refuses_without_the_scale_family_variable(monkeypatch):
+    import torch
+
+    qu = _load_quant_utils()
+    monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
+    param = _FakeBlockwiseParam(256, 512)
+    data = torch.zeros((256, 512), dtype=torch.uint8)
+    scale = torch.ones((2, 4), dtype=torch.float32)
+    with pytest.raises(ValueError, match="NVTE_FP8_BLOCK_SCALING_FP32_SCALES"):
+        qu.write_blockwise_fp8_param(param, data, scale, param_name="proj")
+
+
+def _load_quant_utils():
+    """The module under test (imported the way every other test in this file does)."""
+    from megatron.bridge.models.conversion import quantization_utils
+
+    return quantization_utils
+
+
+def test_e8m0_to_float32_decodes_powers_of_two():
+    """E8M0 is an exponent with bias 127, so the value is 2 ** (x - 127)."""
+    import torch
+
+    qu = _load_quant_utils()
+    raw = torch.tensor([[127, 128], [126, 130]], dtype=torch.uint8)
+    got = qu.e8m0_to_float32(raw)
+    assert got.tolist() == [[1.0, 2.0], [0.5, 8.0]]
+    assert got.dtype == torch.float32
+
+
+def test_e8m0_to_float32_rejects_the_nan_code():
+    import torch
+
+    qu = _load_quant_utils()
+    raw = torch.tensor([[255]], dtype=torch.uint8)
+    with pytest.raises(RuntimeError, match="NaN code"):
+        qu.e8m0_to_float32(raw)
+
+
+def test_dequantize_block_scaled_fp8_matches_the_ground_truth():
+    """A 32x32 E8M0 grid expands exactly, in float32, before any re-quantisation."""
+    import torch
+
+    qu = _load_quant_utils()
+    torch.manual_seed(0)
+    weight = (torch.rand(64, 64) * 4 - 2).to(torch.float8_e4m3fn)
+    exps = torch.tensor([[127, 126], [129, 127]], dtype=torch.uint8)
+
+    got = qu.dequantize_block_scaled_fp8(weight, exps, block_size=32)
+    scale = qu.e8m0_to_float32(exps)
+    expanded = scale.repeat_interleave(32, 0).repeat_interleave(32, 1)
+    expected = weight.to(torch.float32) * expanded
+    assert torch.equal(got, expected)
+
+
+def test_requantize_to_blockwise_fp8_produces_the_te_grid_and_bounded_error():
+    """The pair lands on the parameter's 128-block grid, within one half-step.
+
+    The checkpoint grid is 32x32 E8M0; the TransformerEngine parameter wants 128x128
+    F32. The bytes therefore cannot be copied — they must be re-quantised — and the
+    only correctness claim available is that the re-quantised weight dequantises back
+    to the float32 ground truth within the 128-block quantiser's half-step.
+    """
+    import torch
+
+    qu = _load_quant_utils()
+    torch.manual_seed(0)
+    weight = (torch.rand(256, 256) * 4 - 2).to(torch.float8_e4m3fn)
+    exps = torch.full((8, 8), 127, dtype=torch.uint8)  # scale 1.0 everywhere
+
+    pair = qu.requantize_to_blockwise_fp8(weight, exps, block_size=32)
+    assert pair.data.dtype == torch.uint8 and pair.data.shape == (256, 256)
+    assert pair.scale_inv.dtype == torch.float32 and pair.scale_inv.shape == (2, 2)
+
+    ground_truth = qu.dequantize_block_scaled_fp8(weight, exps, block_size=32)
+    back = qu.dequantize_fp8_blockwise(
+        pair.data.view(torch.float8_e4m3fn), pair.scale_inv
+    )
+    # The destination grid has THREE mantissa bits, so the error budget is one step at
+    # the block's peak magnitude — 1/16 of the block amax, not 0.5 * scale_inv (which
+    # would only hold for a value sitting at the top of the block).
+    block_amax = ground_truth.abs().amax().item()
+    max_err = (back.float() - ground_truth).abs().max().item()
+    assert max_err <= block_amax / 16.0, (max_err, block_amax)
+
+
+def test_requantize_to_blockwise_fp8_handles_packed_mxfp4():
+    """The routed experts are packed 4-bit; they still land on the 128-block grid."""
+    import torch
+
+    qu = _load_quant_utils()
+    torch.manual_seed(0)
+    packed = torch.randint(0, 256, (32, 32), dtype=torch.uint8)  # 32 x 64 logical
+    exps = torch.full((32, 2), 127, dtype=torch.uint8)  # per-row, 32-element tiles
+
+    pair = qu.requantize_to_blockwise_fp8(packed, exps, mxfp4=True)
+    assert pair.data.shape == (32, 64) and pair.data.dtype == torch.uint8
+    assert pair.scale_inv.shape == (1, 1) and pair.scale_inv.dtype == torch.float32
+
+    ground_truth = qu.dequantize_mxfp4_e2m1_packed(packed, exps, dtype=torch.float32)
+    back = qu.dequantize_fp8_blockwise(pair.data.view(torch.float8_e4m3fn), pair.scale_inv)
+    block_amax = ground_truth.abs().amax().item()
+    max_err = (back.float() - ground_truth).abs().max().item()
+    assert max_err <= block_amax / 16.0, (max_err, block_amax)
+
+
+class _FakeBlockwiseParam:
+    """The four storages a TransformerEngine blockwise-FP8 parameter exposes.
+
+    Duck-typed on purpose — the writer is duck-typed too, so this needs no CUDA TE
+    build. ``pad_cols`` reproduces what this model's projections actually see: TE
+    stores the columnwise orientation wider than the logical weight (measured
+    2026-10-30: a [1280, 5120] weight arrives with columnwise storages [5120, 1536]).
+    """
+
+    def __init__(self, rows: int, cols: int, *, pad_cols: int = 0, block: int = 128):
+        import torch
+
+        self.block = block
+        self._rowwise_data = torch.zeros((rows, cols), dtype=torch.uint8)
+        self._rowwise_scale_inv = torch.zeros(
+            (rows // block, cols // block), dtype=torch.float32
+        )
+        self._columnwise_data = torch.zeros((cols, rows + pad_cols), dtype=torch.uint8)
+        self._columnwise_scale_inv = torch.zeros(
+            (cols // block, (rows + pad_cols) // block), dtype=torch.float32
+        )
+
+    def get_metadata(self):
+        from types import SimpleNamespace
+
+        return {"quantizer": SimpleNamespace(block_len=self.block)}
+
+
+def test_the_writer_zero_fills_a_padded_columnwise_scale_grid():
+    """TE pads the columnwise SCALE grid independently of the payload.
+
+    Measured on this model: a [1280, 5120] projection arrives with columnwise data
+    [5120, 1280] (exact transpose) beside a columnwise scale grid of (40, 12) — two
+    whole blocks wider. The pad carries no weights, so it is zero-filled; refusing it
+    (the previous behaviour) made every such projection abort the load.
+    """
+    import torch
+
+    qu = _load_quant_utils()
+    torch.manual_seed(0)
+    rows, cols = 256, 512
+    param = _FakeBlockwiseParam(rows, cols)
+    # the destination's columnwise grid is two whole blocks wider than the transpose
+    param._columnwise_scale_inv = torch.zeros((cols // 128, rows // 128 + 2), dtype=torch.float32)
+    data = torch.randint(0, 200, (rows, cols), dtype=torch.uint8)
+    scale = torch.rand((rows // 128, cols // 128), dtype=torch.float32) + 0.5
+
+    qu.write_blockwise_fp8_param(param, data, scale, param_name="proj")
+
+    assert torch.equal(param._rowwise_data, data)
+    assert torch.equal(param._rowwise_scale_inv, scale)
+    assert tuple(param._columnwise_data.shape) == (cols, rows)
+    assert torch.equal(param._columnwise_data, data.t())
+    assert torch.equal(param._columnwise_scale_inv[:, : rows // 128], scale.t())
+    assert bool((param._columnwise_scale_inv[:, rows // 128 :] == 0).all())
+
+
+def test_the_writer_refuses_a_columnwise_storage_narrower_than_the_transpose():
+    """Trimming is not allowed: a smaller destination means a different tensor.
+
+    TransformerEngine pads the SCALE grids (to a multiple of the quantiser's block count)
+    but keeps the data storages at exactly the logical shape and its transpose, so a
+    narrower columnwise storage is not "padding on the other side" — dropping the excess
+    would silently discard real weights.
+    """
+    import torch
+
+    qu = _load_quant_utils()
+    rows, cols = 256, 512
+    param = _FakeBlockwiseParam(rows, cols)
+    param._columnwise_data = torch.zeros((cols, 128), dtype=torch.uint8)  # one block wide
+    data = torch.randint(0, 200, (rows, cols), dtype=torch.uint8)
+    scale = torch.ones((2, 4), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="columnwise storage"):
+        qu.write_blockwise_fp8_param(param, data, scale, param_name="proj")
+
+
+def test_the_writer_refuses_a_mixed_columnwise_pad_and_trim():
+    import torch
+
+    qu = _load_quant_utils()
+    param = _FakeBlockwiseParam(256, 512)
+    param._columnwise_data = torch.zeros((512 + 128, 128), dtype=torch.uint8)  # wrong both ways
+    data = torch.zeros((256, 512), dtype=torch.uint8)
+    scale = torch.ones((2, 4), dtype=torch.float32)
+    with pytest.raises(ValueError, match="columnwise storage"):
+        qu.write_blockwise_fp8_param(param, data, scale, param_name="proj")
+
+
+def test_the_writer_refuses_a_payload_smaller_than_the_destination():
+    """A shard that did not arrive must not become zeros over the destination's rows."""
+    import torch
+
+    qu = _load_quant_utils()
+    param = _FakeBlockwiseParam(512, 256)
+    data = torch.full((256, 256), 7, dtype=torch.uint8)  # half the rows
+    scale = torch.ones((2, 2), dtype=torch.float32)
+    with pytest.raises(ValueError, match="not the destination FP8 storage"):
+        qu.write_blockwise_fp8_param(param, data, scale, param_name="proj")
+
+

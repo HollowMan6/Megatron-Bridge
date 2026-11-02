@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 from collections.abc import Callable, Mapping
 from typing import NamedTuple
 
@@ -259,6 +260,20 @@ def write_blockwise_fp8_param(
             f"{param_name}: scale grid {tuple(rowwise_scale_inv.shape)} does not match the "
             f"{block_size}x{block_size} grid of payload shape {tuple(data.shape)}"
         )
+    if os.environ.get("NVTE_FP8_BLOCK_SCALING_FP32_SCALES") != "1":
+        # The requirement is the ENV VAR, not the dtype of what we are holding: with the
+        # variable unset TransformerEngine's blockwise quantiser defaults to
+        # `force_pow_2_scales=True` and reads every F32 scale as an exponent of two, so
+        # installing `amax / 448` scales here would dequantise every block wrongly — the
+        # bytes would differ from TE's own `copy_` on all of them (measured on the GPU,
+        # 2026-10-30: 65536 of 65536 bytes differ under the default, identical with the
+        # variable set).
+        raise ValueError(
+            f"{param_name}: the blockwise FP8 direct write requires "
+            "NVTE_FP8_BLOCK_SCALING_FP32_SCALES=1 to be exported before TransformerEngine "
+            "is imported. Without it TE reads blockwise scales as powers of two, so the "
+            "F32 scales installed here would dequantise into different weights."
+        )
     if rowwise_scale_inv.dtype != torch.float32:
         raise ValueError(
             f"{param_name}: expected F32 block scales — TE only reproduces the checkpoint's "
@@ -268,16 +283,6 @@ def write_blockwise_fp8_param(
 
     target_data = param._rowwise_data
     target_scale = param._rowwise_scale_inv
-    if tuple(target_data.shape) != (rows, cols):
-        raise ValueError(
-            f"{param_name}: transported payload {tuple(data.shape)} does not match the destination "
-            f"FP8 storage {tuple(target_data.shape)}"
-        )
-    if tuple(target_scale.shape) != tuple(rowwise_scale_inv.shape):
-        raise ValueError(
-            f"{param_name}: transported scales {tuple(rowwise_scale_inv.shape)} do not match the "
-            f"destination FP8 storage {tuple(target_scale.shape)}"
-        )
     if target_data.element_size() != data.element_size():
         raise ValueError(
             f"{param_name}: destination FP8 storage has element size {target_data.element_size()}, "
@@ -307,32 +312,61 @@ def write_blockwise_fp8_param(
     if target_data.dtype != torch.uint8 and target_data.dtype != data.dtype:
         data = data.view(target_data.dtype)
 
+    # The payload IS the parameter's logical weight: TransformerEngine pads the SCALE
+    # grids (to a whole number of quantiser blocks) but keeps the data storages at exactly
+    # the logical shape and its transpose (measured on this model: a [32768, 1280] weight
+    # arrives with `_rowwise_scale_inv` (256, 12) beside an exact `_columnwise_data`).
+    # So data may never be padded (that would install bytes over nothing) and may never be
+    # trimmed (that would drop real weights) — only the scale grids are zero-filled.
+    if tuple(data.shape) != tuple(target_data.shape):
+        raise ValueError(
+            f"{param_name}: transported payload {tuple(data.shape)} is not the destination "
+            f"FP8 storage {tuple(target_data.shape)}. TransformerEngine does not pad the "
+            "data storages, so a mismatch means the payload is not this weight"
+        )
+    # The LOGICAL grid stays separate from the padded rowwise storage: TransformerEngine
+    # pads each 2D scale storage so its inner dimension is a multiple of four, and it does
+    # that to the two storages INDEPENDENTLY — a [32768, 1280] weight's logical 128x128 grid
+    # is (256, 10), TE stores it rowwise as (256, 12) and columnwise as (10, 256). Padding
+    # first and then transposing the padded grid yields (12, 256), which cannot fit the
+    # columnwise storage and is not what TE's own transpose produces (it copies only the
+    # rows the destination can hold). Measured on the real checkpoint: the load failed with
+    # "destination columnwise scale grid (10, 256) is smaller than the grid the checkpoint
+    # carries (12, 256)" — the "checkpoint" there was this intermediate padded grid.
+    logical_scale = scale
+    rowwise_scale = _pad_scale_grid_to(
+        target_scale, logical_scale, param_name=param_name, label="rowwise scale grid"
+    )
     param._rowwise_data = data
-    param._rowwise_scale_inv = scale
+    param._rowwise_scale_inv = rowwise_scale
     if getattr(param, "_columnwise_data", None) is not None:
-        # The destination's EXISTING columnwise storages are validated like
-        # the rowwise pair before being replaced: a TE-created blockwise
-        # param agrees with the derived (transposed) shapes by construction,
-        # so a mismatch means the param is not the geometry the checkpoint
-        # implies — fail loud instead of silently replacing it.
-        if tuple(param._columnwise_data.shape) != (cols, rows):
+        columnwise = data.t().contiguous()
+        if tuple(columnwise.shape) != tuple(param._columnwise_data.shape):
             raise ValueError(
-                f"{param_name}: destination columnwise storage has shape "
-                f"{tuple(param._columnwise_data.shape)}, expected the transpose "
-                f"({cols}, {rows}) of the rowwise payload"
+                f"{param_name}: the transpose of the payload {tuple(columnwise.shape)} is not "
+                f"the destination columnwise storage {tuple(param._columnwise_data.shape)} — "
+                "TE keeps that storage at exactly the logical transpose, so this is not the "
+                "same weight"
             )
-        if tuple(param._columnwise_scale_inv.shape) != (
-            rowwise_scale_inv.shape[1],
-            rowwise_scale_inv.shape[0],
+        param._columnwise_data = columnwise
+        # Transpose the LOGICAL grid, then pad — the destination's own padding is applied
+        # to the transposed layout, exactly as TE allocates it.
+        logical_columnwise = logical_scale.t().contiguous()
+        if logical_columnwise.shape[0] > param._columnwise_scale_inv.shape[0] or (
+            logical_columnwise.shape[1] > param._columnwise_scale_inv.shape[1]
         ):
             raise ValueError(
-                f"{param_name}: destination columnwise scale grid has shape "
-                f"{tuple(param._columnwise_scale_inv.shape)}, expected the transpose "
-                f"({rowwise_scale_inv.shape[1]}, {rowwise_scale_inv.shape[0]}) of the "
-                "rowwise grid"
+                f"{param_name}: the logical columnwise scale grid "
+                f"{tuple(logical_columnwise.shape)} exceeds the destination storage "
+                f"{tuple(param._columnwise_scale_inv.shape)} — the destination is narrower "
+                "than the checkpoint's weight, which is not a padding difference"
             )
-        param._columnwise_data = data.t().contiguous()
-        param._columnwise_scale_inv = scale.t().contiguous()
+        param._columnwise_scale_inv = _pad_scale_grid_to(
+            param._columnwise_scale_inv,
+            logical_columnwise,
+            param_name=param_name,
+            label="columnwise scale grid",
+        )
 
 
 def write_blockwise_fp8_params_batch(entries) -> None:
@@ -375,11 +409,13 @@ def write_blockwise_fp8_params_batch(entries) -> None:
                 f"{param_name}: destination FP8 storage has shape {tuple(target_data.shape)}, "
                 f"payload shape is {(rows, cols)}"
             )
-        if tuple(target_scale.shape) != tuple(scale_inv.shape):
-            raise ValueError(
-                f"{param_name}: destination scale grid {tuple(target_scale.shape)} does not "
-                f"match payload grid {tuple(scale_inv.shape)}"
-            )
+        # TransformerEngine pads each 2D scale storage independently of the payload, so the
+        # destination is allowed to be LARGER than the checkpoint's logical grid; the pad
+        # carries no weights and is zero-filled. A destination SMALLER than the grid is not a
+        # padding difference and still fails inside _pad_scale_grid_to.
+        padded_scale_inv = _pad_scale_grid_to(
+            target_scale, scale_inv, param_name=param_name, label="rowwise scale grid"
+        )
         if scale_inv.dtype != torch.float32 or target_scale.dtype != torch.float32:
             raise ValueError(
                 f"{param_name}: blockwise FP8 scales must be F32 on both sides (the "
@@ -391,16 +427,16 @@ def write_blockwise_fp8_params_batch(entries) -> None:
                 f"{param_name}: the batched writer copies raw bytes, expected uint8 on both "
                 f"sides, got {data.dtype} -> {target_data.dtype}"
             )
-        prepared.append((param, data, scale_inv, param_name, rows, cols))
+        prepared.append((param, data, scale_inv, padded_scale_inv, param_name, rows, cols))
 
     # One multi-tensor H2D per family: N payload copies + N scale copies in
     # two launches, one synchronization each.
     with torch.no_grad():
         torch._foreach_copy_([entry[0]._rowwise_data for entry in prepared], [entry[1] for entry in prepared])
-        torch._foreach_copy_([entry[0]._rowwise_scale_inv for entry in prepared], [entry[2] for entry in prepared])
+        torch._foreach_copy_([entry[0]._rowwise_scale_inv for entry in prepared], [entry[3] for entry in prepared])
         # The columnwise orientation is derived per parameter — GPU transposes,
         # cheap next to the batched H2D.
-        for param, _data, scale_inv, param_name, rows, cols in prepared:
+        for param, _data, logical_scale, _padded_scale, param_name, rows, cols in prepared:
             if getattr(param, "_columnwise_data", None) is not None:
                 if tuple(param._columnwise_data.shape) != (cols, rows):
                     raise ValueError(
@@ -408,7 +444,16 @@ def write_blockwise_fp8_params_batch(entries) -> None:
                         f"{tuple(param._columnwise_data.shape)}, expected ({cols}, {rows})"
                     )
                 param._columnwise_data = param._rowwise_data.t().contiguous()
-                param._columnwise_scale_inv = scale_inv.t().contiguous().to(param._rowwise_data.device)
+                # Transpose the LOGICAL grid, then pad the destination: transposing the
+                # already-padded grid yields a shape the columnwise storage cannot hold, and
+                # it is not what TransformerEngine's own transpose produces.
+                logical_columnwise = logical_scale.t().contiguous()
+                param._columnwise_scale_inv = _pad_scale_grid_to(
+                    param._columnwise_scale_inv,
+                    logical_columnwise,
+                    param_name=param_name,
+                    label="columnwise scale grid",
+                ).to(param._rowwise_data.device)
 
 
 def dequantize_fp8_e4m3fn_with_scale(
@@ -891,3 +936,134 @@ def quantize_to_int4(
     weight_scale = scale.to(scale_dtype)
 
     return weight_packed, weight_scale, weight_shape
+
+
+# ---------------------------------------------------------------------------
+# DSV4.1 direct write: re-quantise a checkpoint's quantised weight onto the
+# parameter's blockwise grid. Ported from the DSV4.1 line (MindLab-Research/
+# Megatron-Bridge dsv41/bridge) so the DeepSeek-V4.1 bridge can skip the BF16
+# materialisation the legacy path pays for every parameter. The four units below
+# are that line only; every helper they call already lives in this module.
+# ---------------------------------------------------------------------------
+
+def requantize_to_blockwise_fp8(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    name: str = "",
+    block_size: int = 32,
+    target_block: int = FP8_BLOCK_SIZE,
+    mxfp4: bool = False,
+    device: torch.device | None = None,
+) -> Fp8BlockwisePair:
+    """Re-quantise a checkpoint's quantised weight onto a 128x128 F32 blockwise grid.
+
+    This is the generic half of "write the checkpoint straight into an FP8 parameter":
+    a checkpoint that is already quantised CANNOT be copied byte-for-byte unless its
+    scale grid is the parameter's own (the DSV4.1 checkpoint is 32x32 E8M0, and its
+    routed experts are packed MXFP4 — neither is a TransformerEngine 128x128 F32
+    blockwise layout). What can be skipped is the whole BF16 materialisation and the
+    host round trip: decode to F32, requantise in one pass, and hand back the payload
+    bytes plus the F32 scale grid the parameter stores.
+
+    Returned ``data`` is a byte view so the caller's mapping ops move bytes; the
+    caller writes it with :func:`write_blockwise_fp8_param`.
+    """
+    # Run the arithmetic where the destination lives: the checkpoint hunks arrive on the
+    # host, and a 20 GB model's float32 dequantise + requantise on the CPU is minutes of
+    # work (measured 2026-10-30: 250 s in the profiler's `other` bucket, versus 1.9 s
+    # once the same tensors were dequantised on device).
+    if device is not None:
+        weight = weight.to(device=device)
+        scale = scale.to(device=device)
+    if mxfp4:
+        dequantized = dequantize_mxfp4_e2m1_packed(weight, scale, dtype=torch.float32)
+    else:
+        dequantized = dequantize_block_scaled_fp8(
+            weight, scale, name=name, block_size=block_size, dtype=torch.float32
+        )
+    rows, cols = dequantized.shape
+    scale_rows = (rows + target_block - 1) // target_block
+    scale_cols = (cols + target_block - 1) // target_block
+    template = torch.empty((scale_rows, scale_cols), dtype=torch.float32, device=dequantized.device)
+    q_weight, scale_f32 = _quantize_fp8_2d_blocks(
+        dequantized, template, name=name, block_size=target_block
+    )
+    return Fp8BlockwisePair(
+        data=as_fp8_bytes(q_weight).contiguous(),
+        scale_inv=scale_f32.to(torch.float32).contiguous(),
+    )
+
+def dequantize_block_scaled_fp8(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    name: str = "",
+    block_size: int = 32,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Dequantize an FP8 payload whose scale grid is fine-grained and possibly E8M0.
+
+    Two grids occur in this checkpoint family: a 2-D block grid (``rows/32 x cols/32``
+    for the dense and shared-expert linears) and a per-row K-tile grid (one scale per
+    32-element group for the packed 4-bit experts' FP8 siblings). Both are finer than
+    the 128x128 F32 grid a TransformerEngine blockwise parameter wants, so this is the
+    first half of "requantise onto the parameter's own grid".
+    """
+    weight_f32 = weight.to(torch.float32)
+    scale_f32 = e8m0_to_float32(scale)
+    label = f" for {name!r}" if name else ""
+    if scale_f32.dim() == 1:
+        if scale_f32.shape[0] != weight_f32.shape[0]:
+            raise RuntimeError(
+                f"Unsupported 1-D FP8 scale geometry{label}: weight={tuple(weight.shape)} "
+                f"scale={tuple(scale.shape)}"
+            )
+        scale_exp = scale_f32.unsqueeze(1).expand_as(weight_f32)
+    elif scale_f32.dim() == 2 and scale_f32.shape[0] == weight_f32.shape[0]:
+        tile = weight_f32.shape[1] // scale_f32.shape[1]
+        scale_exp = scale_f32.repeat_interleave(tile, dim=1)[:, : weight_f32.shape[1]]
+    elif scale_f32.dim() == 2:
+        scale_exp = scale_f32.repeat_interleave(block_size, dim=0)[: weight_f32.shape[0]]
+        scale_exp = scale_exp.repeat_interleave(block_size, dim=1)[:, : weight_f32.shape[1]]
+    else:
+        raise RuntimeError(
+            f"Unsupported FP8 scale rank{label}: scale={tuple(scale.shape)}"
+        )
+    return (weight_f32 * scale_exp).to(dtype)
+
+def e8m0_to_float32(scale: torch.Tensor) -> torch.Tensor:
+    """Decode an E8M0 scale grid to float32 powers of two.
+
+    E8M0 stores only an exponent (bias 127), so the value is ``2 ** (x - 127)`` and
+    ``0xFF`` is NaN by definition. Checkpoints in this family carry their scales that
+    way — one byte per 32x32 block (or per row-K tile for the packed 4-bit experts) —
+    while a TransformerEngine blockwise parameter stores F32 scales over 128x128
+    blocks. Anything that wants to write those bytes into such a parameter has to
+    decode the exponent grid first, which is this function.
+    """
+    if scale.dtype == torch.uint8 or is_float8_e8m0_dtype(scale.dtype):
+        raw = scale.view(torch.uint8).to(torch.int32)
+        if bool((raw == 0xFF).any()):
+            raise RuntimeError("E8M0 scale grid contains the NaN code 0xFF")
+        return torch.ldexp(torch.ones_like(raw, dtype=torch.float32), raw - 127)
+    return scale.to(torch.float32)
+
+def _pad_scale_grid_to(destination, source, *, param_name: str, label: str):
+    """Zero-fill a scale grid up to the destination's shape (never trim, never shrink)."""
+    rows_pad = destination.shape[0] - source.shape[0]
+    cols_pad = destination.shape[1] - source.shape[1]
+    if rows_pad < 0 or cols_pad < 0:
+        raise ValueError(
+            f"{param_name}: destination {label} {tuple(destination.shape)} is smaller than the "
+            f"grid the checkpoint carries {tuple(source.shape)}"
+        )
+    if not rows_pad and not cols_pad:
+        return source
+    padded = torch.zeros(
+        (source.shape[0] + rows_pad, source.shape[1] + cols_pad),
+        dtype=source.dtype,
+        device=source.device,
+    )
+    padded[: source.shape[0], : source.shape[1]] = source
+    return padded

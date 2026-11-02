@@ -2530,6 +2530,16 @@ class MegatronModelBridge(
 
         return create_bridge_decorator(source=source, target=target, provider=provider, model_type=model_type)
 
+    # DSV4.1: finalize bundled-parameter caches right after an import.
+    def finalize_hf_import(self, megatron_model: Union[MegatronModel, List[MegatronModel]]) -> None:
+        """Finalize tied parameters and any available parameter-derived caches after import."""
+        from megatron.core import resharding
+
+        self._broadcast_shared_embeddings(megatron_model)
+        refresh_module_caches = getattr(resharding, "refresh_module_caches", None)
+        if refresh_module_caches is not None:
+            refresh_module_caches(megatron_model)
+
 
 # Core dispatch functions
 @dispatch
