@@ -17,7 +17,7 @@ import inspect
 import logging
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, Literal
+from typing import Callable, Literal, Self
 
 import torch
 from megatron.core.models.hybrid.hybrid_layer_specs import (
@@ -324,3 +324,9 @@ class HybridModelProvider(TransformerConfig, ModelProviderMixin[MCoreHybridModel
             pg_collection=self._pg_collection,
             scatter_embedding_sequence_parallel=self.scatter_embedding_sequence_parallel,
         )
+
+    def _copy_config_without_runtime_process_groups(self, *, deep: bool) -> Self:
+        """Copy this config without the runtime-only process-group collection."""
+        model_config = copy.copy(self)
+        model_config._pg_collection = None
+        return copy.deepcopy(model_config) if deep else model_config

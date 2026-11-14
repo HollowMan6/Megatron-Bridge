@@ -32,6 +32,22 @@ from megatron.bridge.models.conversion.model_bridge import (
 )
 from megatron.bridge.models.conversion.param_mapping import split_qkv_weights
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+from megatron.bridge.models.conversion.fp8_export import FP8ExportLayout
+from dataclasses import replace
+
+
+def _valid_fp8_layout() -> FP8ExportLayout:
+    """A valid blockwise FP8 layout, as the export path expects per parameter."""
+    return FP8ExportLayout(
+        format_name="blockwise",
+        fp8_dtype="kFloat8E4M3",
+        block_shape=(128, 128),
+        data_dtype=torch.uint8,
+        scale_dtype=torch.float32,
+        scale_shape=(),
+        compact_scale_shape=None,
+        with_gemm_swizzled_scales=False,
+    )
 
 
 _QKV_GLOBAL = "decoder.layers.0.self_attention.linear_qkv.weight"
@@ -66,7 +82,12 @@ def _patch_export_task_context(monkeypatch, bridge, global_name: str, **kwargs):
     monkeypatch.setattr(bridge, "mapping_registry", kwargs["registry_factory"])
     monkeypatch.setattr(bridge, "_share_embeddings_and_output_weights", lambda *_a, **_k: False)
     monkeypatch.setattr(bridge, "_megatron_global_param_names_all_pp_ranks", lambda *_a, **_k: [global_name])
-    monkeypatch.setattr(bridge, "_detect_fp8_params", kwargs.get("detect_fp8", lambda *_a, **_k: {global_name: True}))
+    # _detect_fp8_params reports a layout per parameter (mainline used a bare truthy flag; the
+    # branch's export path needs the declared block shape and dtypes to build the scale_inv tasks).
+    default_layout = _valid_fp8_layout()
+    monkeypatch.setattr(
+        bridge, "_detect_fp8_params", kwargs.get("detect_fp8", lambda *_a, **_k: {global_name: default_layout})
+    )
     monkeypatch.setattr(
         f"{_MODEL_MB}.unwrap_model",
         lambda models: models if isinstance(models, list) else [models],
@@ -219,7 +240,7 @@ class TestFp8ParamExport:
                 with patch.object(AutoBridge, "_causal_lm_architecture", new_callable=PropertyMock) as arch_prop:
                     arch_prop.return_value = arch
                     if expect_raise:
-                        with pytest.raises(ValueError, match="only supports blockwise FP8 parameter export"):
+                        with pytest.raises(ValueError, match="only supports blockwise or MXFP8 parameter export"):
                             list(bridge.export_hf_weights(megatron, cpu=True))
                     else:
                         list(bridge.export_hf_weights(megatron, cpu=True))
@@ -297,7 +318,12 @@ class TestFp8ParamExport:
         )
 
         holder = BlockwiseMetadataTensor()
-        holder.get_metadata = lambda: {"rowwise_scale_inv": torch.ones(1), "is_2D_scaled": False}
+        holder.get_metadata = lambda: {
+            "rowwise_data": torch.zeros(1, dtype=torch.uint8),
+            "rowwise_scale_inv": torch.ones(1),
+            "is_2D_scaled": False,
+            "fp8_dtype": SimpleNamespace(name="kFloat8E4M3"),
+        }
         model = SimpleNamespace(
             config=SimpleNamespace(share_embeddings_and_output_weights=False),
             named_parameters=lambda: [(gname, torch.nn.Parameter(torch.zeros(1)))],
@@ -312,7 +338,7 @@ class TestFp8ParamExport:
 
         def ag(output_list, obj, group=None):
             output_list[0] = obj
-            output_list[1] = {"decoder.layers.1.other.weight": True}
+            output_list[1] = {"decoder.layers.1.other.weight": _valid_fp8_layout()}
 
         monkeypatch.setattr(f"{_MODEL_MB}.torch.distributed.all_gather_object", ag)
         flags = bridge._detect_fp8_params(
@@ -352,7 +378,9 @@ class TestFp8ParamExport:
             registry_factory=lambda: MegatronMappingRegistry(MappingT()),
             pp_rank=1,
             pp_size=2,
-            detect_fp8=lambda *_a, **_k: {gname: 1},
+            # A per-row (2D-scaled) parameter carries a 1-wide scale block, which is what the
+            # scale_inv mapping must be built with.
+            detect_fp8=lambda *_a, **_k: {gname: replace(_valid_fp8_layout(), block_shape=(1, 1))},
         )
 
         model = SimpleNamespace(

@@ -421,7 +421,7 @@ class TestSaveHfAdapter:
         ]
 
         mock_bridge = MagicMock()
-        mock_bridge.export_adapter_weights.return_value = iter(fake_weights)
+        mock_bridge._model_bridge.stream_adapter_weights_megatron_to_hf.return_value = iter(fake_weights)
         mock_bridge.hf_pretrained = _ToyAdapterModel(model_name_or_path="test/model")
 
         with patch("torch.distributed.is_initialized", return_value=False):
@@ -465,7 +465,7 @@ class TestSaveHfAdapter:
         ]
 
         mock_bridge = MagicMock()
-        mock_bridge.export_adapter_weights.return_value = iter(fake_weights)
+        mock_bridge._model_bridge.stream_adapter_weights_megatron_to_hf.return_value = iter(fake_weights)
         mock_bridge.hf_pretrained = _ToyAdapterModel(model_name_or_path="test/model")
 
         with patch("torch.distributed.is_initialized", return_value=False):
@@ -494,7 +494,7 @@ class TestSaveHfAdapter:
         ]
 
         mock_bridge = MagicMock()
-        mock_bridge.export_adapter_weights.return_value = iter(fake_weights)
+        mock_bridge._model_bridge.stream_adapter_weights_megatron_to_hf.return_value = iter(fake_weights)
         mock_bridge.hf_pretrained = _ToyAdapterModel(model_name_or_path="test/model")
 
         with patch("torch.distributed.is_initialized", return_value=False):
@@ -509,7 +509,7 @@ class TestSaveHfAdapter:
                 exclude_adapter_base_prefixes=("mtp.layers",),
             )
 
-        assert mock_bridge.export_adapter_weights.call_args.kwargs["exclude_adapter_base_prefixes"] == ("mtp.layers",)
+        assert mock_bridge._model_bridge.stream_adapter_weights_megatron_to_hf.call_args.kwargs["exclude_adapter_base_prefixes"] == ("mtp.layers",)
 
     @pytest.mark.parametrize("expand_shared_outer", [True, False])
     def test_save_passes_expand_shared_outer(self, tmp_path, expand_shared_outer):
@@ -523,7 +523,7 @@ class TestSaveHfAdapter:
         ]
 
         mock_bridge = MagicMock()
-        mock_bridge.export_adapter_weights.return_value = iter(fake_weights)
+        mock_bridge._model_bridge.stream_adapter_weights_megatron_to_hf.return_value = iter(fake_weights)
         mock_bridge.hf_pretrained = _ToyAdapterModel(model_name_or_path="test/model")
 
         with patch("torch.distributed.is_initialized", return_value=False):
@@ -538,7 +538,7 @@ class TestSaveHfAdapter:
                 expand_shared_outer=expand_shared_outer,
             )
 
-        assert mock_bridge.export_adapter_weights.call_args.kwargs["expand_shared_outer"] is expand_shared_outer
+        assert mock_bridge._model_bridge.stream_adapter_weights_megatron_to_hf.call_args.kwargs["expand_shared_outer"] is expand_shared_outer
 
     def test_save_hf_adapter_clones_aliased_shared_outer_weights(self, tmp_path):
         """Expanded shared-outer weights alias one storage; the save path must clone them.
@@ -561,7 +561,7 @@ class TestSaveHfAdapter:
         ]
 
         mock_bridge = MagicMock()
-        mock_bridge.export_adapter_weights.return_value = iter(fake_weights)
+        mock_bridge._model_bridge.stream_adapter_weights_megatron_to_hf.return_value = iter(fake_weights)
         mock_bridge.hf_pretrained = _ToyAdapterModel(model_name_or_path="test/model")
 
         with patch("torch.distributed.is_initialized", return_value=False):
@@ -594,7 +594,7 @@ class TestSaveHfAdapter:
         ]
 
         mock_bridge = MagicMock()
-        mock_bridge.export_adapter_weights.return_value = iter(fake_weights)
+        mock_bridge._model_bridge.stream_adapter_weights_megatron_to_hf.return_value = iter(fake_weights)
         mock_bridge.hf_pretrained = _ToyAdapterModel(model_name_or_path="test/model")
 
         with patch("torch.distributed.is_initialized", return_value=False):
@@ -616,7 +616,7 @@ class TestSaveHfAdapter:
 
     def test_save_raises_on_empty_adapter(self, tmp_path):
         mock_bridge = MagicMock()
-        mock_bridge.export_adapter_weights.return_value = iter([])
+        mock_bridge._model_bridge.stream_adapter_weights_megatron_to_hf.return_value = iter([])
 
         with patch("torch.distributed.is_initialized", return_value=False):
             from megatron.bridge.models.conversion.auto_bridge import AutoBridge
@@ -642,7 +642,7 @@ class TestSaveHfAdapter:
         ]
 
         mock_bridge = MagicMock()
-        mock_bridge.export_adapter_weights.return_value = iter(fake_weights)
+        mock_bridge._model_bridge.stream_adapter_weights_megatron_to_hf.return_value = iter(fake_weights)
         mock_bridge.hf_pretrained = _ToyAdapterModel(model_name_or_path="inferred/model-id")
 
         with patch("torch.distributed.is_initialized", return_value=False):
@@ -708,7 +708,7 @@ class TestSaveHfAdapter:
         ]
 
         mock_bridge = MagicMock()
-        mock_bridge.export_adapter_weights.return_value = iter(fake_weights)
+        mock_bridge._model_bridge.stream_adapter_weights_megatron_to_hf.return_value = iter(fake_weights)
         mock_bridge.hf_pretrained = _ToyAdapterModel(
             model_name_or_path="test/normalized-expert-model",
             with_packed_experts=True,
@@ -776,7 +776,7 @@ class TestSaveHfAdapter:
         ]
 
         mock_bridge = MagicMock()
-        mock_bridge.export_adapter_weights.return_value = iter(fake_weights)
+        mock_bridge._model_bridge.stream_adapter_weights_megatron_to_hf.return_value = iter(fake_weights)
         mock_bridge.hf_pretrained = _ToyAdapterModel(
             model_name_or_path="test/packed-experts",
             with_packed_experts=True,

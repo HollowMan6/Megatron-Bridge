@@ -22,6 +22,16 @@ from megatron.training.utils.log_utils import (
     warning_filter,  # noqa: F401
 )
 from megatron.training.utils.log_utils import setup_logging as _mlm_setup_logging
+from megatron.bridge.utils.common_utils import get_rank_safe
+import logging
+
+
+class _RankZeroInfoFilter(logging.Filter):
+    """Emit repeated external informational messages on rank zero only."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Resolve rank at emission time because setup can precede distributed init.
+        return record.levelno >= logging.WARNING or get_rank_safe() == 0
 
 
 def setup_logging(

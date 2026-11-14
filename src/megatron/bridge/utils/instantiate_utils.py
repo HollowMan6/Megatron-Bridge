@@ -128,6 +128,31 @@ _DISALLOWED_CALLABLE_FIELD_NAMES: set[str] = {
 # default prefixes are narrower (megatron.training./megatron.core./torch./
 # transformers./signal.) and would otherwise reject e.g. `megatron.bridge.*`,
 # `nvidia.*`, `numpy.*`, `nemo.*`.
+
+_DISALLOWED_TRANSFORMERS_PREFIXES: tuple[str, ...] = (
+    "transformers.dynamic_module_utils.",
+    "transformers.utils.import_utils.",
+    "transformers.pipelines.",
+)
+_DISALLOWED_TRANSFORMERS_METHODS: frozenset[str] = frozenset({"from_pretrained", "from_config"})
+
+def _reject_unsafe_target_name(*, target: str, full_key: str | int) -> None:
+    """Reject known unsafe target names without importing their modules."""
+    field_name = full_key.rsplit(".", 1)[-1] if isinstance(full_key, str) else ""
+    if field_name in _DISALLOWED_CALLABLE_FIELD_NAMES:
+        raise InstantiationException(
+            f"Instantiation of '{target}' is not allowed for callable config field '{full_key}'. "
+            "Use a registered symbolic option or pass a Python callable from trusted application code."
+        )
+    if (
+        target in _DISALLOWED_TARGETS
+        or target.startswith(_DISALLOWED_TRANSFORMERS_PREFIXES)
+        or (target.startswith("transformers.") and target.rsplit(".", 1)[-1] in _DISALLOWED_TRANSFORMERS_METHODS)
+    ):
+        raise InstantiationException(
+            f"Instantiation of '{target}' is not allowed because it can bypass target validation."
+            + (f"\nfull_key: {full_key}" if full_key else "")
+        )
 def _as_module_prefix(prefix: str) -> str:
     """Ensure prefix ends with '.' so allowlist matches at module boundaries."""
     return prefix if prefix.endswith(".") else prefix + "."

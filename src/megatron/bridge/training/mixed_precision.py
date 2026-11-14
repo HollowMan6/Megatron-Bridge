@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 
 @dataclass(kw_only=True)
+
 class MixedPrecisionConfig:
     """Mixed precision configuration for models.
 
@@ -135,6 +136,8 @@ class MixedPrecisionConfig:
             ddp_config = update_config_with_precision_overrides(self, ddp_config)
 
 
+
+
 def update_config_with_precision_overrides(mixed_precision_config: MixedPrecisionConfig, config):
     """Update a config object with precision settings from mixed_precision_config.
 
@@ -179,6 +182,19 @@ def register(func: Callable[[], "MixedPrecisionConfig"]):
         MIXED_PRECISION_RECIPES[hyphen_name] = func
 
     return func
+
+
+@register
+def nemotron_3_ultra_bf16_with_nvfp4_mixed() -> MixedPrecisionConfig:
+    """Create a MixedPrecisionConfig for mixed precision training using BF16 with NVFP4
+    Returns:
+        MixedPrecisionConfig: Configuration for BF16 with NVFP4 mixed precision training
+    """
+    cfg = bf16_with_nvfp4_mixed()
+    cfg.first_last_layers_bf16 = True
+    cfg.num_layers_at_start_in_bf16 = 0
+    cfg.num_layers_at_end_in_bf16 = 16  # last 15% of layers in BF16
+    return cfg
 
 
 @register

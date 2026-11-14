@@ -19,13 +19,23 @@ override system while maintaining compatibility with Megatron Core's post_init b
 """
 
 import copy
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig as MCoreHeterogeneousTransformerConfig,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig as MCoreMLATransformerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig as MCoreTransformerConfig
+from megatron.core.transformer.enums import AttnBackend
+
+def _normalize_attention_backend(config: MCoreTransformerConfig) -> None:
+    """Resolve an unset recipe backend to MCore's supported automatic selection.
+
+    Explicit backend choices and Transformer Engine environment variables are
+    left unchanged. MCore validates that those process-wide settings agree.
+    """
+    if config.attention_backend is None:
+        config.attention_backend = AttnBackend.auto
 
 
 def _safe_asdict(obj, skip_keys: set[str]) -> dict:
@@ -153,6 +163,14 @@ class TransformerConfig(MCoreTransformerConfig):
 
     _NO_COPY_KEYS = {"_pg_collection"}
 
+    # Generalized tensor-parallel metadata. The logical weight-shard counts are configured; the
+    # remat sizes below are derived from them by _finalize_gtp_weight_shards, so a config that
+    # sets neither count stays on the ordinary tensor-parallel path.
+    tensor_parallel_num_weight_shards: int | None = None
+    expert_tensor_parallel_num_weight_shards: int | None = None
+    gtp_weight_remat_size: int = field(init=False, default=1)
+    expert_gtp_weight_remat_size: int = field(init=False, default=1)
+
     def __post_init__(self) -> None:
         """Skip MCore post_init during initial construction.
 
@@ -170,11 +188,13 @@ class TransformerConfig(MCoreTransformerConfig):
         called multiple times safely.
         """
         _resolve_string_fields(self)
+        _normalize_attention_backend(self)
         if self.pipeline_model_parallel_size > 1 and self.pipeline_dtype is None:
             self.pipeline_dtype = self.params_dtype
         if self.sequence_parallel and self.tensor_model_parallel_size <= 1:
             self.sequence_parallel = False
         _set_moe_expert_tensor_parallel_default(self)
+        self._finalize_gtp_weight_shards()
         _enable_safe_hybridep_dispatch(self)
         MCoreTransformerConfig.__post_init__(self)
 
@@ -207,6 +227,24 @@ class TransformerConfig(MCoreTransformerConfig):
     def asdict(self) -> dict:
         """Return a dict view without deep-copying shared handles (e.g., process groups)."""
         return _safe_asdict(self, self._NO_COPY_KEYS)
+
+    def _finalize_gtp_weight_shards(self) -> None:
+        """Derive rematerialization sizes from optional logical weight-shard counts."""
+        for field_name, parallel_size_name, output_name in (
+            ("tensor_parallel_num_weight_shards", "tensor_model_parallel_size", "gtp_weight_remat_size"),
+            (
+                "expert_tensor_parallel_num_weight_shards",
+                "expert_tensor_parallel_size",
+                "expert_gtp_weight_remat_size",
+            ),
+        ):
+            num_weight_shards = getattr(self, field_name, None)
+            if num_weight_shards is None:
+                continue
+            parallel_size = getattr(self, parallel_size_name) or 1
+            if num_weight_shards < parallel_size or num_weight_shards % parallel_size:
+                raise ValueError(f"{field_name} must be divisible by and at least {parallel_size_name}")
+            setattr(self, output_name, num_weight_shards // parallel_size)
 
 
 @dataclass
@@ -247,11 +285,13 @@ class MLATransformerConfig(TransformerConfig, MCoreMLATransformerConfig):
         called multiple times safely.
         """
         _resolve_string_fields(self)
+        _normalize_attention_backend(self)
         if self.pipeline_model_parallel_size > 1 and self.pipeline_dtype is None:
             self.pipeline_dtype = self.params_dtype
         if self.sequence_parallel and self.tensor_model_parallel_size <= 1:
             self.sequence_parallel = False
         _set_moe_expert_tensor_parallel_default(self)
+        self._finalize_gtp_weight_shards()
         _enable_safe_hybridep_dispatch(self)
         MCoreMLATransformerConfig.__post_init__(self)
 
@@ -304,11 +344,13 @@ class HeterogeneousTransformerConfig(TransformerConfig, MCoreHeterogeneousTransf
         It can be called multiple times safely.
         """
         _resolve_string_fields(self)
+        _normalize_attention_backend(self)
         if self.pipeline_model_parallel_size > 1 and self.pipeline_dtype is None:
             self.pipeline_dtype = self.params_dtype
         if self.sequence_parallel and self.tensor_model_parallel_size <= 1:
             self.sequence_parallel = False
         _set_moe_expert_tensor_parallel_default(self)
+        self._finalize_gtp_weight_shards()
         _enable_safe_hybridep_dispatch(self)
         MCoreHeterogeneousTransformerConfig.__post_init__(self)
         if getattr(self, "_enable_in_batch_packing", False) and self.pipeline_model_parallel_size > 1:

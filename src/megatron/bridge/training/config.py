@@ -156,6 +156,12 @@ class DistributedInitConfig(MTrainDistributedInitConfig):
     enable_megatron_core_experimental: bool = False
     """Enable experimental features for Megatron Core."""
 
+    gtp_remat_reduce_scatter_with_fp32_accumulation: bool = False
+    """Accumulate GTP remat reduce-scatter results locally in FP32."""
+
+    gtp_remat_nccl_ub: bool = False
+    """Register the dense GTP remat group with an NCCL symmetric-memory user buffer."""
+
     use_decentralized_pg: bool = False
     """Use ProcessGroupCollection passed through functions instead of relying on mcore's
     global parallel state (mpu) variables. When True, parallel groups are obtained from
@@ -593,6 +599,8 @@ class CheckpointConfig(MTrainCheckpointConfig):
     share the safetensors write workload. See ``SafeTensorsStateSource.save_generator``."""
 
     hf_save_every_n_ranks: int = 1
+    save_rng_state_per_dp_rank: bool = False
+    """Save distinct RNG states for data-parallel ranks whose runtime RNG streams can diverge."""
     """Interval for saving HF safetensors shards across ranks in distributed mode.
     Only effective when ``hf_distributed_save=True``."""
 

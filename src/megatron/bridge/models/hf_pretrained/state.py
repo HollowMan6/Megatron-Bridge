@@ -1279,3 +1279,4 @@ class SafeTensorsStateSource(StateSource):
 
         if is_distributed:
             torch.distributed.barrier()
+

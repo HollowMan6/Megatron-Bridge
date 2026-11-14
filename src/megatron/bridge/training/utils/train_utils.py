@@ -41,6 +41,7 @@ from megatron.bridge.models.common.heads import (
     ensure_model_list,
 )
 from megatron.bridge.training.config import ConfigContainer, ProfilingConfig, TrainingConfig
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
 from megatron.bridge.training.forward_step_func_types import ForwardStepCallable
 from megatron.bridge.training.state import GlobalState, TrainState
 from megatron.bridge.training.utils.mlflow_utils import _sanitize_mlflow_metrics
@@ -56,6 +57,45 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+
+
+def _track_moe_metrics_supports_num_moe_layers() -> bool:
+    """Return whether the active MCore accepts explicit MoE layer counts."""
+    return "num_moe_layers" in inspect.signature(track_moe_metrics).parameters
+def _get_num_moe_layers(model_config: Any) -> int:
+    """Count MoE aux-loss contributors for MCore metric averaging."""
+    num_layers = model_config.num_layers
+    mtp_num_layers = getattr(model_config, "mtp_num_layers", None) or 0
+    repeated_mtp = getattr(model_config, "mtp_use_repeated_layer", False)
+
+    if getattr(model_config, "is_hybrid_model", False) or getattr(model_config, "hybrid_layer_pattern", None):
+        pattern = parse_hybrid_pattern(getattr(model_config, "hybrid_layer_pattern", None))
+        main_moe_layers = (pattern.main_pattern or "").count(Symbols.MOE)
+        mtp_moe_layers = (pattern.mtp_pattern or "").count(Symbols.MOE)
+        mtp_depth = pattern.mtp_num_depths
+    else:
+        moe_layer_freq = getattr(model_config, "moe_layer_freq", None)
+        if moe_layer_freq is None:
+            main_moe_layers = num_layers
+            last_layer_is_moe = True
+        elif isinstance(moe_layer_freq, int):
+            main_moe_layers = sum(i % moe_layer_freq == 0 for i in range(num_layers))
+            last_layer_is_moe = (num_layers - 1) % moe_layer_freq == 0
+        elif isinstance(moe_layer_freq, list):
+            main_moe_layers = sum(moe_layer_freq)
+            last_layer_is_moe = bool(moe_layer_freq[-1])
+        else:
+            raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
+
+        # Non-hybrid MTP copies the final main layer's dense/MoE layout.
+        mtp_moe_layers = int(last_layer_is_moe and mtp_num_layers > 0)
+        mtp_depth = mtp_num_layers
+
+    # A reused MTP block contributes once; distinct blocks contribute at each depth.
+    if not repeated_mtp:
+        mtp_moe_layers *= mtp_depth
+
+    return main_moe_layers + mtp_moe_layers
 def make_value_model(hidden_size: int, sequence_parallel: bool) -> ModelHook:
     """Create a value-head hook compatible with existing external trainer code."""
     return create_value_head_hook(hidden_size=hidden_size, sequence_parallel=sequence_parallel)

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import os
 import re
 import types
 import warnings
@@ -26,6 +27,7 @@ from megatron.core._rank_utils import safe_get_rank as get_rank_safe  # noqa: F4
 from megatron.core._rank_utils import safe_get_world_size as get_world_size_safe  # noqa: F401
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_batch_on_this_cp_rank
+from megatron.core._slurm_utils import resolve_slurm_rank
 from megatron.training.utils.common_utils import get_local_rank_preinit  # noqa: F401
 
 from megatron.bridge.training.utils.packed_seq_utils import get_packed_seq_cp_partition_indices
@@ -33,6 +35,7 @@ from megatron.bridge.utils.slurm_utils import (
     resolve_slurm_master_addr,
     resolve_slurm_master_port,
 )
+
 
 
 try:
@@ -43,6 +46,18 @@ except ImportError:
     ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
 
 
+
+def get_rank_safe() -> int:
+    """Match MCore main rank resolution while keeping malformed launcher values fail-fast on MCore dev."""
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    if "RANK" in os.environ:
+        return int(os.environ["RANK"])
+    slurm_rank = resolve_slurm_rank()
+    if slurm_rank is not None:
+        return slurm_rank
+    warnings.warn("Could not determine rank from torch.distributed, RANK, or SLURM_PROCID. Defaulting to rank 0.")
+    return 0
 def get_last_rank() -> int:
     """Get the last rank in the distributed group"""
     if not torch.distributed.is_initialized():

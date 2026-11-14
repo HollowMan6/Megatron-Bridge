@@ -27,6 +27,11 @@ from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.bridge.training.state import TrainState
 from megatron.bridge.training.utils.config_utils import apply_run_config_backward_compat
 from megatron.bridge.utils.common_utils import get_rank_safe, get_world_size_safe, print_rank_0
+from megatron.bridge.utils.instantiate_utils import (
+    _DISALLOWED_CANONICAL_TARGETS,
+    InstantiationException,
+    _reject_unsafe_target_name,
+)
 
 
 TRAIN_STATE_FILE = "train_state.pt"
@@ -38,20 +43,43 @@ _RUNTIME_ONLY_TARGETS = frozenset({"megatron.core.timers.Timers"})
 _RECIPE_CONFIG_TARGET = "megatron.core.quantization.quant_config.RecipeConfig"
 
 
+def _validate_run_config_targets(value: Any, path: str = "") -> None:
+    """Reject known unsafe checkpoint targets before compatibility code imports them.
+
+    A run config is a YAML file of ``_target_`` entries that the loader instantiates, so it is
+    untrusted input on the same footing as a CLI argument: the canonical deny-list and the
+    dotted-name checks apply here too, and they run before the backward-compatibility rewrite
+    touches the tree.
+    """
+    if isinstance(value, dict):
+        target = value.get("_target_")
+        if isinstance(target, str):
+            full_key = f"{path}._target_" if path else "_target_"
+            _reject_unsafe_target_name(target=target, full_key=full_key)
+            if target in _DISALLOWED_CANONICAL_TARGETS:
+                raise InstantiationException(f"Instantiation of '{target}' is not allowed.\nfull_key={full_key}")
+        for key, child in value.items():
+            if key != "_target_":
+                child_path = f"{path}.{key}" if path else str(key)
+                _validate_run_config_targets(child, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_run_config_targets(child, f"{path}[{index}]")
+
+
 def file_exists(path: str) -> bool:
-    """Check if a file exists.
+    """Return whether a path exists, through MultiStorageClient when it is enabled.
 
     Args:
-        path: The path to the file. Can be a local path or an MSC URL.
+        path: Local path or MSC URL.
 
     Returns:
-        True if the file exists, False otherwise.
+        True when the object exists.
     """
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
         return msc.os.path.exists(path)
-    else:
-        return os.path.exists(path)
+    return os.path.exists(path)
 
 
 def join_paths(*paths: str) -> str:
@@ -415,6 +443,7 @@ def read_run_config(run_config_filename: str) -> dict[str, Any]:
                     with open(run_config_filename, "r") as f:
                         config_dict = yaml.safe_load(f)
                 config_dict = _sanitize_run_config_object(config_dict)
+                _validate_run_config_targets(config_dict)
                 config_dict = apply_run_config_backward_compat(config_dict)
                 config_obj[0] = config_dict
             except Exception as e:
@@ -442,6 +471,7 @@ def read_run_config(run_config_filename: str) -> dict[str, Any]:
             raise RuntimeError(f"Unable to load config file {run_config_filename}: {e}") from e
 
         config_dict = _sanitize_run_config_object(config_dict)
+        _validate_run_config_targets(config_dict)
         config_dict = apply_run_config_backward_compat(config_dict)
         return config_dict
 

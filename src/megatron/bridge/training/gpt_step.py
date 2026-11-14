@@ -61,6 +61,14 @@ _MCORE_EXPERT_BIAS_PADDING_MASK_PATCHED = "_mbridge_expert_bias_padding_mask_com
 _MCORE_SCHEDULE_PADDING_MASK_PATCHED = "_mbridge_schedule_padding_mask_compatible"
 
 
+
+def _keep_full_position_ids_for_cp(model_cfg, cp_size: int) -> bool:
+    """Whether the model's rotary embedding CP-shards the position ids itself.
+
+    mrope builds its embedding from whatever ids it is given and then shards that, so sharding them
+    here as well leaves the embedding at seq/cp**2 against hidden states at seq/cp.
+    """
+    return cp_size > 1 and getattr(model_cfg, "position_embedding_type", None) == "mrope"
 def _trim_padded_cu_seqlens_for_cp(cu_seqlens: torch.Tensor, cu_seqlens_argmin: torch.Tensor | None) -> torch.Tensor:
     """Trim padded THD cu_seqlens without introducing a CUDA sync."""
     if cu_seqlens_argmin is not None:
@@ -468,12 +476,28 @@ def get_batch(
     )
 
     cp_size = pg_collection.cp.size()
+    model_cfg = getattr(cfg, "model", None)
     has_packed = _has_packed_sequence_metadata(batch)
     if has_packed and cp_size > 1:
+        if _keep_full_position_ids_for_cp(model_cfg, cp_size):
+            # The THD partition shards position_ids, and only Qwen3VLModel.forward sets
+            # ``is_thd_format`` to stop the rotary embedding sharding them again -- that forward
+            # is not in the loop for the GPT step, so the embedding would land at T/cp**2.
+            raise ValueError(
+                "Packed sequences with context parallelism are not supported for mrope models "
+                "through the GPT step. Use unpacked data, or cp_size=1."
+            )
         batch = _partition_packed_batch_for_cp(batch, pg_collection.cp)
     else:
+        # An mrope model derives positions itself from the full sequence; slicing them with the
+        # batch would make the rotary embedding apply the CP slice a second time.
+        full_position_ids = (
+            batch.get("position_ids") if _keep_full_position_ids_for_cp(model_cfg, cp_size) else None
+        )
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=pg_collection.cp)
+        if full_position_ids is not None:
+            batch["position_ids"] = full_position_ids
 
     return (
         batch["tokens"],

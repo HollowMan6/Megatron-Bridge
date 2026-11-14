@@ -58,6 +58,10 @@ from megatron.bridge.training.checkpointing import (
     maybe_load_dataloader_state,
 )
 from megatron.bridge.training.config import ConfigContainer
+from megatron.bridge.training.gtp import (
+    classify_gtp_remat_chains,
+    configure_gtp_remat,
+)
 from megatron.bridge.training.fsdp_compat import MEGATRON_FSDP_TYPES
 from megatron.bridge.training.initialize import initialize_megatron, set_jit_fusion_options
 from megatron.bridge.training.optim import (
@@ -76,6 +80,16 @@ from megatron.bridge.training.utils.log_utils import append_to_progress_log, bar
 from megatron.bridge.training.utils.train_utils import start_memory_history_recording
 from megatron.bridge.utils.common_utils import get_rank_safe, print_rank_0
 
+
+def _freeze_base_model_for_mtp(model: list[MegatronModule]) -> list[MegatronModule]:
+    """Freeze backbone parameters and router bias updates before distributed wrapping."""
+    for model_chunk in model:
+        for name, parameter in model_chunk.named_parameters():
+            parameter.requires_grad_("mtp.layers." in name)
+        for name, module in model_chunk.named_modules():
+            if hasattr(module, "expert_bias"):
+                module.frozen_expert_bias = "mtp.layers." not in name
+    return model
 
 def _get_embedding_ranks(
     pp_ranks: list[int],
@@ -589,10 +603,23 @@ def _register_setup_pre_wrap_hook(
 def _build_distributed_model(cfg: ConfigContainer, pg_collection: ProcessGroupCollection) -> list[MegatronModule]:
     """Build distributed model from either ModelConfig or ModelProviderMixin."""
     model_config = cfg.model
+    if not isinstance(model_config, ModelConfig):
+        model_config.finalize()
+
+    # TE's grouped tensor parallel weight rematerialisation has to be configured on the process
+    # groups before the model is built, and the built model's shard chains classified after --
+    # the remat sizes it keys off are derived in the config's finalize().
+    configure_gtp_remat(
+        model_config,
+        reduce_scatter_with_fp32_accumulation=cfg.dist.gtp_remat_reduce_scatter_with_fp32_accumulation,
+        nccl_ub=cfg.dist.gtp_remat_nccl_ub,
+        pg_collection=pg_collection,
+    )
+
     if isinstance(model_config, ModelConfig):
         builder_cls = model_config.get_builder_cls()
         builder = builder_cls(model_config)
-        return builder.build_distributed_models(
+        model = builder.build_distributed_models(
             pg_collection=pg_collection,
             ddp_config=cfg.ddp,
             overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
@@ -601,8 +628,7 @@ def _build_distributed_model(cfg: ConfigContainer, pg_collection: ProcessGroupCo
             data_parallel_random_init=cfg.rng.data_parallel_random_init,
         )
     else:
-        model_config.finalize()
-        return model_config.provide_distributed_model(
+        model = model_config.provide_distributed_model(
             ddp_config=cfg.ddp,
             use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
             use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
@@ -610,6 +636,9 @@ def _build_distributed_model(cfg: ConfigContainer, pg_collection: ProcessGroupCo
             data_parallel_random_init=cfg.rng.data_parallel_random_init,
             pg_collection=pg_collection,
         )
+
+    classify_gtp_remat_chains(model, model_config)
+    return model
 
 
 def _update_model_config_funcs(

@@ -73,6 +73,10 @@ _enabled: Optional[bool] = None
 _totals: Dict[str, float] = dict.fromkeys(TIMED_PHASES, 0.0)
 _read_bytes = 0
 _params = 0
+#: Dequantization calls split by the device that ran them: a phase that is slow
+#: because the GPU path never fires looks identical to one that is slow on purpose.
+_dequant_gpu = 0
+_dequant_host = 0
 _depth = 0
 _start = 0.0
 _total: Optional[float] = None
@@ -96,6 +100,12 @@ class LoadProfileSnapshot:
     read_bytes: int
     #: Parameters processed by the per-parameter loop.
     params: int
+    #: Dequantization calls split by device: a slow phase whose GPU path never fired
+    #: looks exactly like one that is slow because the work is on the host.
+    # Defaults keep a snapshot built by a caller that does not track the split
+    # constructible (the counters are diagnostics, not part of the measurement contract).
+    dequant_gpu: int = 0
+    dequant_host: int = 0
 
     @property
     def other(self) -> float:
@@ -131,6 +141,9 @@ def reset() -> None:
 
 
 def _clear_accumulators() -> None:
+    global _dequant_gpu, _dequant_host
+    _dequant_gpu = 0
+    _dequant_host = 0
     """Zero the counters but keep the resolved enabled flag."""
     global _read_bytes, _params, _total
     _read_bytes = 0
@@ -218,6 +231,17 @@ def add_read_tensors(tensors: Mapping[str, object]) -> None:
     add_read_bytes(nbytes)
 
 
+def count_dequant(on_device: bool) -> None:
+    """Record one dequantization and the device that performed it."""
+    if not is_enabled():
+        return
+    global _dequant_gpu, _dequant_host
+    if on_device:
+        _dequant_gpu += 1
+    else:
+        _dequant_host += 1
+
+
 def count_param(n: int = 1) -> None:
     """Count ``n`` parameters processed by the load loop (ignored when off)."""
     global _params
@@ -291,6 +315,8 @@ def snapshot() -> LoadProfileSnapshot:
         total=total if total > 0.0 else 0.0,
         read_bytes=_read_bytes,
         params=_params,
+        dequant_gpu=_dequant_gpu,
+        dequant_host=_dequant_host,
     )
 
 
@@ -341,7 +367,8 @@ def format_summary(
     return (
         f"LOAD_PROFILE: rank {rank} | {snap.params} params"
         f" | read {read:.1f}s ({share:.1f}%)"
-        f" | dequant {dequant:.1f}s"
+        f" | dequant {dequant:.1f}s (gpu {snap.dequant_gpu}"
+        f" / host {snap.dequant_host})"
         f" | map {mapping:.1f}s"
         f" | copy {copy:.1f}s"
         f" | other {snap.other:.1f}s"

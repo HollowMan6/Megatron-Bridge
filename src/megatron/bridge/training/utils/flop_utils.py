@@ -15,7 +15,10 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+import inspect
 import torch
+from megatron.core.models.gpt import experimental_attention_variant_module_specs
+from megatron.core.transformer.spec_utils import ModuleSpec, get_module
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
     get_hybrid_layer_counts,
@@ -27,6 +30,12 @@ from megatron.bridge.data.packing.algorithms import calculate_avg_seqlen
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training.config import ConfigContainer
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
+from typing import Any, Callable, cast
+
+_mcore_is_gated_delta_net_variant = cast(
+    Callable[[str | None], bool] | None,
+    getattr(experimental_attention_variant_module_specs, "is_gated_delta_net_variant", None),
+)
 
 
 _lora_seq_stats_cache: dict = {}
@@ -61,6 +70,30 @@ class GlobalFlopsRuntimeStats:
         """Return whether exact additive vision-patch statistics were collected."""
         return self.vision_patch_sum > 0
 
+
+def _uses_gated_delta_product(model_config: Any) -> bool:
+    """Identify GDP from the configured hybrid mixer's module specification."""
+    spec = getattr(model_config, "hybrid_stack_spec", None)
+    if spec is None:
+        return False
+    if not isinstance(spec, ModuleSpec) and callable(spec):
+        spec = spec(model_config) if inspect.signature(spec).parameters else spec()
+    mamba_layer = getattr(getattr(spec, "submodules", None), "mamba_layer", None)
+    mixer = getattr(getattr(mamba_layer, "submodules", None), "mixer", None)
+    module = get_module(mixer) if isinstance(mixer, ModuleSpec) else mixer
+    if not isinstance(module, type):
+        return False
+    from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+
+    return issubclass(module, GatedDeltaProductMixer)
+
+def _is_gated_delta_net_variant(experimental_attention_variant: str | None) -> bool:
+    """Recognize GDN variants across current main and older MCore dev branches."""
+    if experimental_attention_variant == "gdn2":
+        return True
+    if _mcore_is_gated_delta_net_variant is not None:
+        return _mcore_is_gated_delta_net_variant(experimental_attention_variant)
+    return experimental_attention_variant in {"gated_delta_net", "gdn"}
 
 def _packed_data_exists(path: str | None) -> bool:
     """Return True if a packed dataset file exists, for both parquet and npy formats.

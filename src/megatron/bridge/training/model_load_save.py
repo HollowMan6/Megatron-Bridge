@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import argparse
 import logging
 import os
@@ -48,6 +49,39 @@ HF_BASED_TOKENIZERS = [
     "HuggingFaceTokenizer",
 ]
 
+
+def _get_or_initialize_pg_collection(
+    model_cfg: TransformerConfig | ModelConfig,
+) -> ProcessGroupCollection:
+    """Return MPU process groups, initializing model-parallel state when needed."""
+    from megatron.bridge.training.gtp import configure_gtp_remat
+
+    configure_gtp_remat(model_cfg)
+    if not parallel_state.is_initialized():
+        init_kwargs = dict(
+            tensor_model_parallel_size=model_cfg.tensor_model_parallel_size,
+            pipeline_model_parallel_size=model_cfg.pipeline_model_parallel_size,
+            virtual_pipeline_model_parallel_size=model_cfg.virtual_pipeline_model_parallel_size,
+            context_parallel_size=model_cfg.context_parallel_size or 1,
+            expert_model_parallel_size=model_cfg.expert_model_parallel_size or 1,
+            expert_tensor_parallel_size=model_cfg.expert_tensor_parallel_size,
+        )
+        # The remat sizes only exist on a megatron-core line that carries grouped tensor
+        # parallelism; passing them to an older line is a TypeError at the call, so ask the
+        # signature rather than the config.
+        gtp_kwargs = {
+            "gtp_remat_size": getattr(model_cfg, "gtp_weight_remat_size", 1),
+            "expert_gtp_remat_size": getattr(model_cfg, "expert_gtp_weight_remat_size", 1),
+        }
+        init_params = inspect.signature(parallel_state.initialize_model_parallel).parameters
+        init_kwargs.update({k: v for k, v in gtp_kwargs.items() if k in init_params})
+        parallel_state.initialize_model_parallel(**init_kwargs)
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+
+            model_parallel_cuda_manual_seed(0)
+
+    return ProcessGroupCollection.use_mpu_process_groups()
 
 def _uses_hybrid_rng_tracker(model_cfg: Any) -> bool:
     is_hybrid_model = getattr(model_cfg, "is_hybrid_model", False)
@@ -350,7 +384,14 @@ def build_and_load_model(
         if isinstance(model_cfg, ModelProviderMixin):
             if hasattr(model_cfg, "finalize"):
                 model_cfg.finalize()
-            return model_cfg.provide_distributed_model(wrap_with_ddp=False, use_cpu_initialization=use_cpu_init)
+            # The GTP remat sizes the config derives in finalize() have to reach
+            # initialize_model_parallel, and GTP has to be configured before the groups exist.
+            pg_collection = _get_or_initialize_pg_collection(model_cfg)
+            return model_cfg.provide_distributed_model(
+                wrap_with_ddp=False,
+                use_cpu_initialization=use_cpu_init,
+                pg_collection=pg_collection,
+            )
         elif isinstance(model_cfg, ModelConfig):
             if hasattr(model_cfg, "finalize"):
                 model_cfg.finalize()

@@ -14,11 +14,13 @@
 
 from __future__ import annotations
 
+import functools
 import itertools
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from string import digits
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, TypeVar, Union
+from typing import Tuple, TYPE_CHECKING, Dict, Iterable, List, Optional, TypeVar, Union
 
 import torch
 from megatron.core import parallel_state
@@ -56,6 +58,108 @@ if TYPE_CHECKING:
     )
     from megatron.bridge.peft.base import PEFT
 
+
+# Projections whose shared-outer LoRA factor is lora_A (gate/up) or lora_B (down).
+# ``base_layer`` / ``experts`` are the expert-agnostic stems the vLLM 3D-MoE layout uses for
+# gate_up / down respectively.
+_SHARED_OUTER_LORA_A_PROJECTIONS = frozenset(
+    {"gate_proj", "up_proj", "gate_up_proj", "w1", "w3", "linear_fc1", "fc1", "base_layer"}
+)
+_SHARED_OUTER_LORA_B_PROJECTIONS = frozenset({"down_proj", "w2", "linear_fc2", "fc2", "experts"})
+
+
+def _is_expert_adapter_base_name(base_name: str) -> bool:
+    """Return whether an HF LoRA base name addresses a routed-expert projection."""
+    return base_name.endswith(".experts") or ".experts." in base_name
+
+def _expected_shared_outer_side(base_name: str) -> Optional[str]:
+    """Return the LoRA suffix a shared-outer adapter shares for this projection, if known."""
+    projection = base_name.rsplit(".", 1)[-1]
+    if projection in _SHARED_OUTER_LORA_A_PROJECTIONS:
+        return ".lora_A.weight"
+    if projection in _SHARED_OUTER_LORA_B_PROJECTIONS:
+        return ".lora_B.weight"
+    return None
+
+def _lora_rank_of(lora_suffix: str, tensor: torch.Tensor) -> int:
+    """Rank axis of an exported LoRA factor: ``[.., r, in]`` for lora_A, ``[.., out, r]`` for lora_B."""
+    return int(tensor.shape[-2] if lora_suffix == ".lora_A.weight" else tensor.shape[-1])
+
+def _classify_shared_outer_expert_export(
+    base_name: str,
+    weights: Dict[str, torch.Tensor],
+    module_weights: Dict[str, torch.Tensor],
+) -> Optional[str]:
+    """Return the shared LoRA suffix of a shared-outer MoE LoRA export, or ``None`` otherwise.
+
+    Shared-outer expert LoRA shares lora_A on the first expert projection (gate/up) and
+    lora_B on the second (down). The shared factor is exported once as a ``[1, ...]``
+    tensor under the expert-agnostic HF name; its per-expert partner is either the
+    numbered 2D slices of the default layout (``...experts.N.<proj>``) or an
+    ``[E, ...]`` stack under the same expert-agnostic name. A regular per-expert export
+    (equal expert dims on both sides) returns ``None`` and stays on the PEFT
+    ``target_parameters`` packing path.
+
+    Raises:
+        ValueError: for layouts that are neither -- unequal expert dims with no side equal
+            to 1, the shared factor on the wrong side, a rank mismatch between the two
+            sides, or a shared factor without any per-expert partner.
+    """
+    if not _is_expert_adapter_base_name(base_name):
+        return None
+    lora_a = weights.get(".lora_A.weight")
+    lora_b = weights.get(".lora_B.weight")
+
+    if lora_a is not None and lora_b is not None:
+        if lora_a.shape[0] == lora_b.shape[0]:
+            return None
+        shared_sides = [
+            suffix
+            for suffix, tensor in ((".lora_A.weight", lora_a), (".lora_B.weight", lora_b))
+            if tensor.shape[0] == 1
+        ]
+        if len(shared_sides) != 1:
+            raise ValueError(
+                f"Cannot pack the MoE LoRA export for {base_name} into PEFT target_parameters: lora_A has expert "
+                f"dim {lora_a.shape[0]} but lora_B has {lora_b.shape[0]}. A per-expert pair has equal expert dims "
+                "and a shared-outer pair has exactly one side with expert dim 1."
+            )
+        shared_suffix = shared_sides[0]
+        partner_suffix = ".lora_B.weight" if shared_suffix == ".lora_A.weight" else ".lora_A.weight"
+        partner_ranks = {_lora_rank_of(partner_suffix, weights[partner_suffix])}
+    else:
+        shared_suffix, shared = next(iter(weights.items()))
+        if shared.shape[0] != 1:
+            # A lone per-expert stack is not shared-outer; the packing path reports it as incomplete.
+            return None
+        partner_suffix = ".lora_B.weight" if shared_suffix == ".lora_A.weight" else ".lora_A.weight"
+        prefix, separator, projection = base_name.partition(".experts.")
+        sibling = re.compile(
+            rf"^{re.escape(prefix)}\.experts\.\d+\.{re.escape(projection)}{re.escape(partner_suffix)}$"
+        )
+        partners = [tensor for name, tensor in module_weights.items() if separator and sibling.match(name)]
+        if not partners:
+            raise ValueError(
+                f"Shared-outer MoE LoRA export for {base_name} has a shared {shared_suffix[1:-7]} factor of shape "
+                f"{tuple(shared.shape)} but no per-expert {partner_suffix[1:-7]} partner (neither numbered "
+                f"experts.N.{projection or '<proj>'} slices nor an [E, ...] stack under the same name)."
+            )
+        partner_ranks = {_lora_rank_of(partner_suffix, tensor) for tensor in partners}
+
+    expected_suffix = _expected_shared_outer_side(base_name)
+    if expected_suffix is not None and expected_suffix != shared_suffix:
+        raise ValueError(
+            f"Shared-outer MoE LoRA export for {base_name} shares {shared_suffix[1:-7]}, but a shared-outer adapter "
+            "shares lora_A on the first expert projection (gate/up) and lora_B on the second (down); this looks "
+            "like a malformed export."
+        )
+    shared_rank = _lora_rank_of(shared_suffix, weights[shared_suffix])
+    if partner_ranks != {shared_rank}:
+        raise ValueError(
+            f"Shared-outer MoE LoRA export for {base_name} has rank {shared_rank} on its shared "
+            f"{shared_suffix[1:-7]} factor but rank(s) {sorted(partner_ranks)} on the per-expert {partner_suffix[1:-7]} side."
+        )
+    return shared_suffix
 
 class _AbsentProjectionSentinel:
     """Singleton sentinel returned by ``_split_qkv_linear_out_weight`` to declare that
@@ -1048,6 +1152,9 @@ class MegatronPeftBridge:
         show_progress: bool = True,
         exclude_adapter_base_prefixes: Iterable[str] | None = None,
         expand_shared_outer: bool = False,
+        stack_3d_moe: bool = False,
+        with_megatron_names: bool = False,
+        moe_shared_loras: bool = False,
     ) -> Iterable["HFWeightTuple"]:
         """Stream only adapter weights without merging them into base tensors.
 
@@ -1081,6 +1188,13 @@ class MegatronPeftBridge:
             is_grouped_expert = is_expert and ".local_experts." not in adapter_task.global_base_prefix
             is_shared_outer_lora = is_grouped_expert and linear_in_tensor.ndim != linear_out_tensor.ndim
 
+            # Megatron weight names behind lora_A / lora_B, surfaced with ``with_megatron_names``
+            # so a serving-side consumer can map an exported HF weight back to its source.
+            source_names = (
+                adapter_weight.linear_in_weight.param_name,
+                adapter_weight.linear_out_weight.param_name,
+            )
+
             if is_shared_outer_lora:
                 yield from self._stream_shared_outer_adapter_weights(
                     megatron_model,
@@ -1091,6 +1205,10 @@ class MegatronPeftBridge:
                     num_moe_experts,
                     cpu,
                     expand_shared_outer=expand_shared_outer,
+                    stack_3d_moe=stack_3d_moe,
+                    moe_shared_loras=moe_shared_loras,
+                    source_names=source_names,
+                    with_megatron_names=with_megatron_names,
                 )
                 continue
 
@@ -1278,6 +1396,10 @@ class MegatronPeftBridge:
         num_moe_experts: int,
         cpu: bool,
         expand_shared_outer: bool,
+        stack_3d_moe: bool = False,
+        source_names: Optional[Tuple[str, str]] = None,
+        with_megatron_names: bool = False,
+        moe_shared_loras: bool = False,
     ) -> Iterable["HFWeightTuple"]:
         """Stream a shared-outer grouped-expert LoRA adapter (SGLang PR #21466).
 
@@ -1286,15 +1408,59 @@ class MegatronPeftBridge:
         ``[1, ...]`` tensor under the expert-agnostic HF name. With
         ``expand_shared_outer``, it is replicated under per-expert 2D names
         (vLLM 2D ``pack_moe`` contract); the training-side parameter stays shared.
+
+        With ``stack_3d_moe``, the whole adapter is emitted as the two stacked 3D
+        tensors vLLM's 3D-MoE consumer (``FusedMoE3DWithLoRA``) looks up:
+        ``...experts.base_layer`` (gate_up_proj) and bare ``...experts`` (down_proj),
+        with axis order ``lora_A=(E, r, in)`` and ``lora_B=(out, r, E)``. This is the
+        vLLM-3D-MoE analogue of the 2D ``expand_shared_outer`` path and is required
+        for 3D-MoE models (``is_3d_moe_weight=True``) that are not using vLLM's 2D
+        mixed MoE LoRA format.
+
+        With ``moe_shared_loras``, the legacy shared-outer tensors are reused and
+        repacked as vLLM's 2D ``experts.w1/w2/w3`` layout.
+
+        The layout flags are resolved in priority order: ``stack_3d_moe``, then
+        ``moe_shared_loras``, then ``expand_shared_outer``; the first one set wins.
         """
 
-        from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
-
         is_expert = is_expert_linear(adapter_task.global_base_prefix)
-        for side_tensor, side_suffix in (
-            (linear_in_tensor, ".linear_in.weight"),
-            (linear_out_tensor, ".linear_out.weight"),
+        in_name, out_name = source_names if source_names is not None else (None, None)
+
+        if stack_3d_moe:
+            yield from self._stream_shared_outer_adapter_weights_3d_moe(
+                megatron_model,
+                mapping_registry,
+                adapter_task,
+                linear_in_tensor,
+                linear_out_tensor,
+                num_moe_experts,
+                cpu,
+                is_expert,
+                source_names=source_names,
+                with_megatron_names=with_megatron_names,
+            )
+            return
+
+        if moe_shared_loras:
+            yield from self._stream_shared_outer_adapter_weights_2d_moe(
+                megatron_model,
+                mapping_registry,
+                adapter_task,
+                linear_in_tensor,
+                linear_out_tensor,
+                num_moe_experts,
+                cpu,
+                source_names=source_names,
+                with_megatron_names=with_megatron_names,
+            )
+            return
+
+        for side_tensor, side_suffix, side_source in (
+            (linear_in_tensor, ".linear_in.weight", in_name),
+            (linear_out_tensor, ".linear_out.weight", out_name),
         ):
+            emit = functools.partial(self._make_hf_weight, side_source, with_megatron_names)
             if side_tensor.ndim == 2 and not expand_shared_outer:
                 # Shared side: emit one [1, out, in] tensor. A shared linear_in
                 # feeding a fused gate/up FC1 maps to two HF names, so the same
@@ -1307,7 +1473,7 @@ class MegatronPeftBridge:
                 )
                 for base_name in base_hf_weight_names:
                     hf_name = self._make_lora_param_name(self._strip_hf_expert_index(base_name), side_suffix)
-                    yield HFWeightTuple(hf_name, current)
+                    yield emit(hf_name, current)
                 continue
 
             if side_tensor.ndim == 2 and expand_shared_outer:
@@ -1325,7 +1491,7 @@ class MegatronPeftBridge:
                         hf_name = self._make_lora_param_name(base_name, side_suffix)
                         if hf_name is None:
                             continue
-                        yield HFWeightTuple(hf_name, shared_current)
+                        yield emit(hf_name, shared_current)
                 continue
 
             # Per-expert side: emit one slice per global expert. A fused FC1
@@ -1348,12 +1514,12 @@ class MegatronPeftBridge:
                         megatron_model, base_hf_weight_names, current, is_expert=is_expert
                     )
                 if per_base is None:
-                    yield HFWeightTuple(side_hf_names[0], current)
+                    yield emit(side_hf_names[0], current)
                     continue
                 for index, base_name in enumerate(base_hf_weight_names):
                     chunk = per_base.get(base_name)
                     assert chunk is not None, f"unknown projection name: {base_name!r}"
-                    yield HFWeightTuple(side_hf_names[index], chunk)
+                    yield emit(side_hf_names[index], chunk)
 
     def _get_fused_adapter_linear_out_slices(
         self,
@@ -1698,6 +1864,213 @@ class MegatronPeftBridge:
 
         return converted_weights_dict
 
+    @staticmethod
+    def _make_hf_weight(
+        megatron_param_name: Optional[str],
+        with_megatron_names: bool,
+        hf_name: str,
+        tensor: torch.Tensor,
+    ) -> "HFWeightTuple":
+        """Build the exported tuple, attaching the source Megatron name only when requested.
+
+        Adapter weights always come from exactly one Megatron parameter, so the sourced tuple
+        carries a one-element ``megatron_param_names``; a missing source (not expected on any
+        current path) is reported as an empty tuple rather than silently dropping the flag.
+        """
+        from megatron.bridge.models.conversion.model_bridge import HFSourcedWeightTuple, HFWeightTuple
+
+        if with_megatron_names:
+            sources = (megatron_param_name,) if megatron_param_name is not None else ()
+            return HFSourcedWeightTuple(hf_name, tensor, sources)
+        return HFWeightTuple(hf_name, tensor)
+
+    def _stream_shared_outer_adapter_weights_2d_moe(
+        self,
+        megatron_model: List[MegatronModel],
+        mapping_registry: "MegatronMappingRegistry",
+        adapter_task: AdapterWeightConversionTask,
+        linear_in_tensor: torch.Tensor,
+        linear_out_tensor: torch.Tensor,
+        num_moe_experts: int,
+        cpu: bool,
+        source_names: Optional[Tuple[str, str]] = None,
+        with_megatron_names: bool = False,
+    ) -> Iterable["HFWeightTuple"]:
+        """Reuse the ordinary shared-outer emission, then stack it for vLLM 2D MoE.
+
+        The unstacked path is the source of truth for mapping lookup, EP gather,
+        and fused gate/up splitting. This adapter only changes the final names and
+        expert axis to the ``experts.w1/w2/w3`` contract.
+        """
+        emitted = list(
+            self._stream_shared_outer_adapter_weights(
+                megatron_model,
+                mapping_registry,
+                adapter_task,
+                linear_in_tensor,
+                linear_out_tensor,
+                num_moe_experts,
+                cpu,
+                expand_shared_outer=False,
+                stack_3d_moe=False,
+                moe_shared_loras=False,
+                source_names=source_names,
+                with_megatron_names=with_megatron_names,
+            )
+        )
+        if not emitted:
+            return
+
+        in_name, out_name = source_names if source_names is not None else (None, None)
+        emit_in = functools.partial(self._make_hf_weight, in_name, with_megatron_names)
+        emit_out = functools.partial(self._make_hf_weight, out_name, with_megatron_names)
+
+        def _projection(name: str) -> str:
+            parts = name.split(".")
+            experts_idx = parts.index("experts")
+            projection_idx = experts_idx + 1
+            if projection_idx < len(parts) and parts[projection_idx].isdigit():
+                projection_idx += 1
+            return parts[projection_idx]
+
+        stem = emitted[0].param_name.split(".experts", 1)[0] + ".experts"
+        by_projection: Dict[str, Dict[str, List[Tuple[Optional[int], torch.Tensor]]]] = defaultdict(
+            lambda: {"A": [], "B": []}
+        )
+        for item in emitted:
+            suffix = "A" if item.param_name.endswith(".lora_A.weight") else "B"
+            by_projection[_projection(item.param_name)][suffix].append(
+                (self._infer_hf_expert_idx(item.param_name), item.weight)
+            )
+
+        def _shared(projection: str, suffix: str) -> torch.Tensor:
+            values = by_projection[projection][suffix]
+            if len(values) != 1 or values[0][0] is not None:
+                raise ValueError(f"Expected one shared {suffix} factor for {projection}")
+            return values[0][1]
+
+        def _per_expert(projection: str, suffix: str) -> torch.Tensor:
+            values = sorted(by_projection[projection][suffix], key=lambda value: value[0] or 0)
+            if len(values) != num_moe_experts or any(idx is None for idx, _ in values):
+                raise ValueError(f"Expected {num_moe_experts} per-expert {suffix} factors for {projection}")
+            return torch.stack([tensor for _, tensor in values], dim=0)
+
+        gate_projection = next((p for p in by_projection if p in {"gate_proj", "w1"}), None)
+        up_projection = next((p for p in by_projection if p in {"up_proj", "w3"}), None)
+        down_projection = next((p for p in by_projection if p in {"down_proj", "w2"}), None)
+        if gate_projection is not None and up_projection is not None:
+            shared_a = _shared(gate_projection, "A")
+            if not torch.equal(shared_a, _shared(up_projection, "A")):
+                raise ValueError("Shared gate/up LoRA-A factors differ")
+            yield emit_in(f"{stem}.w1.lora_A.weight", shared_a)
+            yield emit_out(f"{stem}.w1.lora_B.weight", _per_expert(gate_projection, "B"))
+            yield emit_in(f"{stem}.w3.lora_A.weight", shared_a)
+            yield emit_out(f"{stem}.w3.lora_B.weight", _per_expert(up_projection, "B"))
+            return
+
+        if down_projection is None:
+            raise ValueError(
+                "moe_shared_loras requires gated routed experts with gate/up (w1/w3) and down (w2) projections; "
+                f"found {sorted(by_projection)} under {stem}"
+            )
+        yield emit_in(f"{stem}.w2.lora_A.weight", _per_expert(down_projection, "A"))
+        yield emit_out(f"{stem}.w2.lora_B.weight", _shared(down_projection, "B"))
+
+    def _stream_shared_outer_adapter_weights_3d_moe(
+        self,
+        megatron_model: List[MegatronModel],
+        mapping_registry: "MegatronMappingRegistry",
+        adapter_task: AdapterWeightConversionTask,
+        linear_in_tensor: torch.Tensor,
+        linear_out_tensor: torch.Tensor,
+        num_moe_experts: int,
+        cpu: bool,
+        is_expert: bool,
+        source_names: Optional[Tuple[str, str]] = None,
+        with_megatron_names: bool = False,
+    ) -> Iterable["HFWeightTuple"]:
+        """Emit a shared-outer routed-expert LoRA adapter in vLLM 3D-MoE layout.
+
+        vLLM's 3D-MoE LoRA consumer (``FusedMoE3DWithLoRA`` → ``_stack_moe_lora_weights``)
+        looks up exactly two stacked 3D tensors per registered ``...experts`` module:
+
+          * ``...experts.base_layer.lora_{A,B}.weight`` — gate_up_proj (gate+up fused)
+          * ``...experts.lora_{A,B}.weight``            — down_proj (bare)
+
+        with axis order ``lora_A=(E, r, in)`` and ``lora_B=(out, r, E)``. The
+        per-expert 2D names emitted by the ``expand_shared_outer`` path never match,
+        so vLLM silently drops the routed-expert LoRA. This stacks the full global
+        expert set (``num_moe_experts``) into those two 3D tensors; vLLM EP-slices
+        ``[expert_start:expert_end]`` at load time, so the global stack is a no-op for
+        non-EP and correct for EP.
+
+        Each adapter task is either FC1 (gate_up → ``base_layer``) or FC2 (down →
+        bare), distinguished by the HF base weight names it resolves to. A fused FC1
+        ``linear_out`` carries gate+up on its output dim already, matching vLLM's
+        ``2*moe_intermediate`` w13 fused stack, so no gate/up re-split is needed.
+        """
+        in_name, out_name = source_names if source_names is not None else (None, None)
+
+        # Resolve the HF base names for expert 0 to discover this adapter's projection
+        # (gate_up vs down) and the expert-agnostic stem (...experts).
+        base_hf_weight_names = self._get_base_hf_param_names_for_adapter(
+            mapping_registry,
+            adapter_task.global_base_prefix,
+            adapter_task.adapter_key,
+            ".weight0",
+        )
+        if not base_hf_weight_names:
+            return
+
+        is_gate_up = any(
+            self._is_fused_fc1_gate_proj(n) or self._is_fused_fc1_up_proj(n) for n in base_hf_weight_names
+        )
+        # stem e.g. "model.layers.0.mlp.experts.gate_proj.weight" -> "...mlp.experts".
+        stem = self._strip_hf_expert_index(base_hf_weight_names[0]).split(".experts")[0] + ".experts"
+
+        # --- lora_A: shared linear_in (r, in) -> broadcast to (E, r, in) ---
+        # Shared-outer keeps lora_A as a 2D tensor reused across experts; expand it
+        # along a leading expert axis. (A per-expert lora_A would be unexpected here,
+        # but the selection path handles it uniformly if it ever occurs.)
+        if linear_in_tensor.ndim == 2:
+            lora_a_3d = linear_in_tensor.unsqueeze(0).expand(num_moe_experts, -1, -1).contiguous()
+        else:
+            gathered_in = self._gather_expert_adapter_weight(linear_in_tensor)
+            lora_a_3d = torch.stack(
+                [
+                    self._select_expert_adapter_weight(linear_in_tensor, gathered_in, i, num_moe_experts)
+                    for i in range(num_moe_experts)
+                ],
+                dim=0,
+            )
+        if cpu:
+            lora_a_3d = lora_a_3d.cpu()
+
+        # --- lora_B: per-expert linear_out (E, out, r) -> permute to (out, r, E) ---
+        # ``_select_expert_adapter_weight`` returns the per-expert slice across EP
+        # ranks uniformly (EP>1 gathers, EP=1 indexes the local expert dim); stacking
+        # all global experts yields the (E, out, r) tensor vLLM expects, already
+        # carrying gate+up fused on the output dim for FC1.
+        gathered_out = self._gather_expert_adapter_weight(linear_out_tensor)
+        if gathered_out is None and linear_out_tensor.ndim > 2:
+            # EP=1: tensor is already (E, out, r), skip the per-expert stack loop.
+            linear_out_all = linear_out_tensor
+        else:
+            linear_out_all = torch.stack(
+                [
+                    self._select_expert_adapter_weight(linear_out_tensor, gathered_out, i, num_moe_experts)
+                    for i in range(num_moe_experts)
+                ],
+                dim=0,
+            )
+        lora_b_3d = linear_out_all.permute(1, 2, 0).contiguous()
+        if cpu:
+            lora_b_3d = lora_b_3d.cpu()
+
+        suffix = "base_layer." if is_gate_up else ""
+        yield self._make_hf_weight(in_name, with_megatron_names, f"{stem}.{suffix}lora_A.weight", lora_a_3d)
+        yield self._make_hf_weight(out_name, with_megatron_names, f"{stem}.{suffix}lora_B.weight", lora_b_3d)
+
 
 _HF_LORA_SUFFIXES = (".lora_A.weight", ".lora_B.weight")
 
@@ -1776,6 +2149,8 @@ def _pack_target_parameter_adapter_weights(
 
 def convert_adapter_weights_to_peft_state(
     adapter_weights: Iterable["HFWeightTuple"],
+    *,
+    allow_serving_layout: bool = False,
 ) -> tuple[Dict[str, torch.Tensor], List[str], List[str]]:
     """Rewrite exported adapter weights into the PEFT on-disk state-dict layout.
 
@@ -1783,6 +2158,13 @@ def convert_adapter_weights_to_peft_state(
     the exported HF names, write normal 2D LoRA tensors directly under
     ``base_model.model.*``, and only special-case 3D tensors because PEFT stores
     packed parameter targets through ``ParamWrapper``.
+
+    A shared-outer MoE LoRA (one factor shared across experts, the other per-expert)
+    has no ``ParamWrapper`` representation, so ``PeftModel.from_pretrained`` cannot load
+    it. By default such an export raises; with ``allow_serving_layout=True`` both sides
+    are written exactly as exported (the shared factor once as ``[1, ...]`` under the
+    expert-agnostic name, next to its per-expert partner), which is the layout serving
+    stacks keyed on the leading expert dim (SGLang ``experts_shared_outer_loras``) read.
     """
 
     adapter_weights = list(adapter_weights)
@@ -1798,6 +2180,7 @@ def convert_adapter_weights_to_peft_state(
 
     adapter_state: Dict[str, torch.Tensor] = {}
     module_weight_names: List[str] = []
+    module_weights: Dict[str, torch.Tensor] = {}
     target_parameters: List[str] = []
     parameter_weights: Dict[str, Dict[str, torch.Tensor]] = defaultdict(dict)
 
@@ -1813,6 +2196,30 @@ def convert_adapter_weights_to_peft_state(
 
         adapter_state[f"base_model.model.{name}"] = tensor
         module_weight_names.append(name)
+        module_weights[name] = tensor
+
+    # Shared-outer MoE LoRA has no common expert dim to pack along. Validate the layout
+    # (exactly one shared side, on the expected projection, matching ranks) and only
+    # write it as exported when the caller explicitly asked for the serving layout.
+    shared_outer_targets = [
+        base_name
+        for base_name in target_parameters
+        if _classify_shared_outer_expert_export(base_name, parameter_weights[base_name], module_weights) is not None
+    ]
+    if shared_outer_targets and not allow_serving_layout:
+        raise ValueError(
+            f"Shared-outer MoE LoRA export for {shared_outer_targets} (a factor shared across experts next to a "
+            "per-expert partner) has no PEFT ParamWrapper representation, so PeftModel.from_pretrained could not "
+            "load it. Export with expand_shared_outer=True to replicate the shared factor into the per-expert PEFT "
+            "layout, or pass allow_serving_layout=True to write the serving layout (SGLang "
+            "experts_shared_outer_loras) as exported."
+        )
+    for base_name in shared_outer_targets:
+        for lora_suffix, tensor in parameter_weights[base_name].items():
+            name = f"{base_name}{lora_suffix}"
+            adapter_state[f"base_model.model.{name}"] = tensor
+            module_weight_names.append(name)
+    target_parameters = [base_name for base_name in target_parameters if base_name not in shared_outer_targets]
 
     target_parameters = _order_target_parameters(target_parameters)
     parameter_prefixes = _build_target_parameter_prefixes(target_parameters)
