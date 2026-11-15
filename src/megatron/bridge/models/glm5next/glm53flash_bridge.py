@@ -32,7 +32,23 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-from megatron.core.ssm.kda_layer_config import KDALayerConfig
+try:
+    from megatron.core.ssm.kda_layer_config import KDALayerConfig
+
+    HAVE_KDA_LAYER_CONFIG = True
+except ImportError:  # megatron-core line without the KDA layer config
+    HAVE_KDA_LAYER_CONFIG = False
+
+    class KDALayerConfig:  # type: ignore[no-redef]
+        """Placeholder base so this module imports on a line without the KDA layer config.
+
+        ``megatron.bridge.models`` imports every family's bridge eagerly, so a family needing a
+        symbol the installed megatron-core lacks would otherwise make the whole package
+        unimportable -- including the families that line does support. GLM-5.3-Flash cannot be
+        built on such a line; the guard that says so lives in the provider's ``provide`` hooks,
+        because the provider is a dataclass and a base-class ``__init__`` is never called.
+        """
+
 from megatron.core.tensor_parallel import scatter_to_sequence_parallel_region
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.module import MegatronModule
@@ -253,6 +269,20 @@ def glm53_hybrid_stack_spec(config: HybridMLAModelProvider) -> ModuleSpec:
 # ---------------------------------------------------------------------------
 
 
+
+def _require_kda_layer_config() -> None:
+    """Fail where GLM-5.3-Flash is actually built, on a line that lacks the KDA layer config.
+
+    The provider is a dataclass, so a base-class ``__init__`` never runs and cannot be the guard;
+    the two hooks that build the model are.
+    """
+    if not HAVE_KDA_LAYER_CONFIG:
+        raise RuntimeError(
+            "GLM-5.3-Flash needs a megatron-core line that provides "
+            "megatron.core.ssm.kda_layer_config.KDALayerConfig; the installed line does not."
+        )
+
+
 @dataclass
 class GLM53FlashModelProvider(HybridMLAModelProvider, KDALayerConfig):
     """Provider for the unified GLM-5.3-Flash VLM: hybrid language stack + HF vision."""
@@ -282,6 +312,7 @@ class GLM53FlashModelProvider(HybridMLAModelProvider, KDALayerConfig):
         self, pre_process: Optional[bool] = None, post_process: Optional[bool] = None, vp_stage: Optional[int] = None
     ) -> "GLM53FlashModel":
         """Build the VLM wrapper and apply explicitly requested freeze options."""
+        _require_kda_layer_config()
         model = GLM53FlashModel(self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
         if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
             model.freeze(
@@ -295,6 +326,7 @@ class GLM53FlashModelProvider(HybridMLAModelProvider, KDALayerConfig):
         self, pre_process: Optional[bool] = None, post_process: Optional[bool] = None, vp_stage: Optional[int] = None
     ):
         """Build the Megatron HybridModel language model (delegates to the parent)."""
+        _require_kda_layer_config()
         return super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
 
 

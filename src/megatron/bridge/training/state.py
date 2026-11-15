@@ -20,7 +20,11 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
-from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
+try:
+    from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
+except ImportError:  # a megatron-core line without the async checkpoint strategy
+    get_async_strategy = None  # type: ignore[assignment]
+
 from megatron.core.energy_monitor import EnergyMonitor
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.timers import Timers
@@ -418,6 +422,12 @@ class GlobalState:
             and self.cfg.checkpoint.save is not None
             and self.cfg.checkpoint.async_save
         ):
+            if get_async_strategy is None:
+                raise RuntimeError(
+                    "async_save needs a megatron-core line that provides "
+                    "megatron.core.dist_checkpointing.strategies.torch.get_async_strategy; "
+                    "the installed line does not."
+                )
             async_strategy, async_modules = get_async_strategy(self.cfg.checkpoint.async_strategy)
             async_calls_queue_cls = async_modules["AsyncCallsQueue"]
             get_write_results_queue_fn = async_modules["get_write_results_queue"]
