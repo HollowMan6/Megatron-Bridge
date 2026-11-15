@@ -273,6 +273,35 @@ class WeightConversionTask(Generic[MappingT]):
         return self.mapping.local_hf_param_specs(self.global_param_name)
 
 
+
+#: Suffix a bridge uses for a parameter the checkpoint must not carry.
+INIT_ONLY_SUFFIX = ".__init_only__"
+
+
+def _preload_payload_keys(tasks: Any) -> set[str]:
+    """The HF-side keys the batched preload should read, minus the ones no checkpoint carries.
+
+    A bridge declares a parameter with no checkpoint counterpart by naming its HF side
+    ``<key>.__init_only__``; the mapping layer then initializes it instead of loading it. Such a
+    key is deliberately absent from the checkpoint, so asking the state source for it fails with
+    ``Keys not found`` before the per-parameter path ever gets the chance to skip it (measured
+    2026-11-15 on DeepSeek-V4.1: every ``engram_hash.*.__init_only__``).
+    """
+    keys: set[str] = set()
+    for task in tasks:
+        if task.megatron_module is None:
+            continue
+        hf_param = task.mapping.hf_param
+        if isinstance(hf_param, str):
+            if not hf_param.endswith(INIT_ONLY_SUFFIX):
+                keys.add(hf_param)
+        else:
+            keys.update(
+                str(name) for name in hf_param.values() if not str(name).endswith(INIT_ONLY_SUFFIX)
+            )
+    return keys
+
+
 class _HFNameSuffixMapping:
     """A lightweight wrapper mapping that appends a suffix to all HF param names on export.
 
@@ -1507,15 +1536,7 @@ class MegatronModelBridge(
             # set); BF16-source params keep their legacy handling.
             import collections
 
-            payload_keys = set()
-            for task in hf_to_megatron_tasks:
-                if task.megatron_module is None:
-                    continue
-                hf_param = task.mapping.hf_param
-                if isinstance(hf_param, str):
-                    payload_keys.add(hf_param)
-                else:
-                    payload_keys.update(str(name) for name in hf_param.values())
+            payload_keys = _preload_payload_keys(hf_to_megatron_tasks)
             scale_keys = {key + "_scale_inv" for key in payload_keys if (key + "_scale_inv") in hf_state_dict}
             try:
                 preloaded = hf_state_dict[sorted(payload_keys | scale_keys)]

@@ -846,3 +846,43 @@ def test_build_conversion_tasks_allows_explicit_hf_name_mismatch(monkeypatch):
     assert len(tasks) == 1
     assert tasks[0].global_param_name == "decoder.weight"
     assert tasks[0].megatron_module is None
+
+
+def test_preload_payload_keys_skips_parameters_no_checkpoint_carries():
+    """`<hf key>.__init_only__` means "initialize it", so the preload must not ask for it.
+
+    The batched FP8 preload reads every HF-side key in one call; a synthetic init-only key is
+    absent from the checkpoint by construction, so including it raises `Keys not found` before
+    the per-parameter path can skip it. Measured 2026-11-15 on DeepSeek-V4.1, whose bridge
+    declares every `engram_hash.*` buffer this way.
+    """
+    from megatron.bridge.models.conversion.model_bridge import _preload_payload_keys
+
+    tasks = [
+        SimpleNamespace(
+            megatron_module=object(),
+            mapping=SimpleNamespace(hf_param="model.layers.0.mlp.weight"),
+        ),
+        SimpleNamespace(
+            megatron_module=object(),
+            mapping=SimpleNamespace(hf_param="engram_hash.multipliers.__init_only__"),
+        ),
+        SimpleNamespace(
+            megatron_module=object(),
+            mapping=SimpleNamespace(
+                hf_param={
+                    "payload": "model.layers.1.mlp.weight",
+                    "init": "engram_hash.offsets.__init_only__",
+                }
+            ),
+        ),
+        # A parameter with no Megatron module is not part of the load at all.
+        SimpleNamespace(
+            megatron_module=None,
+            mapping=SimpleNamespace(hf_param="not.loaded.weight"),
+        ),
+    ]
+
+    keys = _preload_payload_keys(tasks)
+
+    assert keys == {"model.layers.0.mlp.weight", "model.layers.1.mlp.weight"}
