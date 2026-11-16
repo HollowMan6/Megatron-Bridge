@@ -597,6 +597,7 @@ class TestGlobalState:
 
         with (
             patch("megatron.bridge.training.state.HAVE_NVRX", True),
+            patch("megatron.bridge.training.state.get_async_strategy", None),
             patch.dict(
                 "sys.modules",
                 {
@@ -609,6 +610,58 @@ class TestGlobalState:
 
         mock_async_queue_cls.assert_called_once_with(persistent=True)
         assert state._async_calls_queue == mock_async_queue
+        assert state.async_checkpoint_strategy == "nvrx"
+
+    def test_initialize_async_checkpoint_worker_honors_legacy_mcore_strategy_with_nvrx_available(self):
+        """Explicit MCore save requests require a matching queue even when NVRx is installed."""
+        state = GlobalState()
+        state._cfg = SimpleNamespace(
+            checkpoint=SimpleNamespace(
+                save="/tmp/checkpoints",
+                async_save=True,
+                async_strategy="mcore",
+                ckpt_format="torch_dist",
+                non_persistent_ckpt_type="global",
+                use_persistent_ckpt_worker=True,
+                async_ckpt_cpu_priority=10,
+                async_ckpt_io_priority=3,
+                async_write_results_mp_mode="fork",
+            )
+        )
+        mcore_queue = MagicMock()
+        mcore_queue_cls = MagicMock(return_value=mcore_queue)
+        get_write_results_queue = MagicMock()
+        nvrx_core = MagicMock()
+
+        with (
+            patch("megatron.bridge.training.state.HAVE_NVRX", True),
+            patch("megatron.bridge.training.state.get_rank_safe", return_value=0),
+            patch(
+                "megatron.bridge.training.state.get_async_strategy",
+                return_value=(
+                    "mcore",
+                    {"AsyncCallsQueue": mcore_queue_cls, "get_write_results_queue": get_write_results_queue},
+                ),
+            ) as resolve_strategy,
+            patch.dict(
+                "sys.modules",
+                {
+                    "nvidia_resiliency_ext.checkpointing.async_ckpt.core": nvrx_core,
+                    "nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async": MagicMock(),
+                },
+            ),
+        ):
+            state.initialize_async_checkpoint_worker()
+
+        resolve_strategy.assert_called_once_with("mcore")
+        nvrx_core.AsyncCallsQueue.assert_not_called()
+        mcore_queue_cls.assert_called_once_with(persistent=True)
+        mcore_queue.warmup_persistent_caller.assert_called_once_with(
+            0, mp_mode="spawn", cpu_priority=10, io_priority=3
+        )
+        get_write_results_queue.assert_called_once_with("fork")
+        assert state.async_calls_queue is mcore_queue
+        assert state.async_checkpoint_strategy == "mcore"
 
     def test_initialize_async_checkpoint_worker_disabled(self):
         """Test async checkpoint worker not initialized when disabled."""

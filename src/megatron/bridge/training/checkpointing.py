@@ -144,6 +144,8 @@ _FULLY_PARALLEL_LOAD_HAS_PER_RANK_OBJECTS = (
 _FULLY_PARALLEL_SAVE_HAS_VALIDATION_POLICY = (
     "validate_access_integrity" in inspect.signature(FullyParallelSaveStrategyWrapper).parameters
 )
+# Older Core lets callers select the async writer backend.
+_DIST_CKPT_SAVE_HAS_ASYNC_STRATEGY = "async_strategy" in inspect.signature(dist_checkpointing.save).parameters
 
 
 _, HAVE_RESIL = safe_import("nvidia_resiliency_ext.checkpointing")
@@ -1547,11 +1549,17 @@ def save_checkpoint(
             optimizer.save_state_dict_to_file(optim_checkpoint_name)
 
     async_save_request = None
+    async_kwargs = {}
     if ckpt_cfg.async_save:
         if ckpt_type == CheckpointType.GLOBAL and ckpt_cfg.ckpt_format not in ["torch_dist", "fsdp_dtensor"]:
             raise NotImplementedError(
                 f"Async checkpoint save not implemented for {ckpt_cfg.ckpt_format} distributed checkpoint format"
             )
+        if ckpt_type == CheckpointType.GLOBAL and ckpt_format == "torch_dist" and _DIST_CKPT_SAVE_HAS_ASYNC_STRATEGY:
+            strategy = state.async_checkpoint_strategy
+            if strategy is None:
+                raise RuntimeError("Initialize the async checkpoint worker before saving asynchronously.")
+            async_kwargs["async_strategy"] = strategy
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
@@ -1729,6 +1737,7 @@ def save_checkpoint(
                 preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
                 content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
                 verify_integrity=ckpt_cfg.verify_integrity,
+                **async_kwargs,
             )
             # [ModelOpt]: save sharded modelopt_state (skip if model is empty, e.g., low-memory save mode).
             # We always anchor modelopt_state at the iteration directory (``checkpoint_name``) so

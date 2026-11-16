@@ -1209,7 +1209,10 @@ class TestSaveCheckpoint:
 
         assert finalize_devices == [3]
 
-    def test_async_retention_keeps_tracker_checkpoint_until_finalize(self, tmp_path, save_checkpoint_fixtures):
+    @pytest.mark.parametrize("legacy_async_strategy", [False, True], ids=["modern-core", "legacy-core"])
+    def test_async_retention_keeps_tracker_checkpoint_until_finalize(
+        self, tmp_path, save_checkpoint_fixtures, legacy_async_strategy
+    ):
         """The tracker-selected checkpoint must survive until its async replacement is durable."""
         old_checkpoint = tmp_path / "iter_0000500"
         current_checkpoint = tmp_path / "iter_0001000"
@@ -1223,6 +1226,7 @@ class TestSaveCheckpoint:
         state.cfg.checkpoint.save = str(tmp_path)
         state.cfg.checkpoint.async_save = True
         state.cfg.checkpoint.most_recent_k = 1
+        state.async_checkpoint_strategy = "mcore" if legacy_async_strategy else "nvrx"
         state.wandb_logger = Mock()
 
         pg_collection = Mock()
@@ -1253,7 +1257,10 @@ class TestSaveCheckpoint:
             return thread
 
         with (
-            patch("megatron.bridge.training.checkpointing.dist_checkpointing.save", side_effect=start_async_save),
+            patch("megatron.bridge.training.checkpointing._DIST_CKPT_SAVE_HAS_ASYNC_STRATEGY", legacy_async_strategy),
+            patch(
+                "megatron.bridge.training.checkpointing.dist_checkpointing.save", side_effect=start_async_save
+            ) as mock_dist_save,
             patch("megatron.bridge.training.checkpointing.TorchDistSaveShardedStrategy", return_value=Mock()),
             patch("megatron.bridge.training.checkpointing.get_pg_collection", return_value=pg_collection),
             patch("megatron.bridge.training.checkpointing.get_rng_state", return_value=Mock()),
@@ -1292,6 +1299,10 @@ class TestSaveCheckpoint:
                 checkpointing_context={},
             )
 
+            if legacy_async_strategy:
+                assert mock_dist_save.call_args.kwargs["async_strategy"] == "mcore"
+            else:
+                assert "async_strategy" not in mock_dist_save.call_args.kwargs
             assert call_order == ["register_cleanup", "schedule"]
             assert old_checkpoint.is_dir()
             assert current_checkpoint.is_dir()
