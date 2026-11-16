@@ -798,6 +798,86 @@ class TestAutoBridge:
         assert callable(AutoBridge.get_model)
         assert not hasattr(AutoBridge, "get_megatron_model")
 
+    @pytest.mark.parametrize("supports_gtp", [False, True], ids=["legacy-core", "gtp-core"])
+    def test_standalone_model_parallel_init_supports_core_signatures(self, supports_gtp):
+        """Standalone construction omits unsupported GTP keywords and forwards supported sizes."""
+        initialized = {}
+
+        def initialize_legacy(
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            virtual_pipeline_model_parallel_size,
+            context_parallel_size,
+            expert_model_parallel_size,
+            expert_tensor_parallel_size,
+        ):
+            initialized.update(
+                tensor_model_parallel_size=tensor_model_parallel_size,
+                pipeline_model_parallel_size=pipeline_model_parallel_size,
+                virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+                context_parallel_size=context_parallel_size,
+                expert_model_parallel_size=expert_model_parallel_size,
+                expert_tensor_parallel_size=expert_tensor_parallel_size,
+            )
+
+        def initialize_gtp(
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            virtual_pipeline_model_parallel_size,
+            context_parallel_size,
+            expert_model_parallel_size,
+            expert_tensor_parallel_size,
+            gtp_remat_size=1,
+            expert_gtp_remat_size=1,
+        ):
+            initialize_legacy(
+                tensor_model_parallel_size,
+                pipeline_model_parallel_size,
+                virtual_pipeline_model_parallel_size,
+                context_parallel_size,
+                expert_model_parallel_size,
+                expert_tensor_parallel_size,
+            )
+            initialized.update(gtp_remat_size=gtp_remat_size, expert_gtp_remat_size=expert_gtp_remat_size)
+
+        config = SimpleNamespace(
+            tensor_model_parallel_size=2,
+            pipeline_model_parallel_size=3,
+            virtual_pipeline_model_parallel_size=4,
+            context_parallel_size=None,
+            expert_model_parallel_size=None,
+            expert_tensor_parallel_size=1,
+            gtp_weight_remat_size=2 if supports_gtp else 1,
+            expert_gtp_weight_remat_size=4 if supports_gtp else 1,
+        )
+        groups = object()
+        with (
+            patch("megatron.bridge.models.conversion.auto_bridge.dist.is_initialized", return_value=True),
+            patch.object(parallel_state, "is_initialized", return_value=False),
+            patch.object(
+                parallel_state, "initialize_model_parallel", new=initialize_gtp if supports_gtp else initialize_legacy
+            ),
+            patch(
+                "megatron.bridge.models.conversion.auto_bridge.ProcessGroupCollection.use_mpu_process_groups"
+            ) as use_mpu,
+            patch.object(torch.cuda, "is_available", return_value=False),
+        ):
+            use_mpu.return_value = groups
+            result = AutoBridge._get_or_initialize_pg_collection(config)
+
+        assert result is groups
+        expected = {
+            "tensor_model_parallel_size": 2,
+            "pipeline_model_parallel_size": 3,
+            "virtual_pipeline_model_parallel_size": 4,
+            "context_parallel_size": 1,
+            "expert_model_parallel_size": 1,
+            "expert_tensor_parallel_size": 1,
+        }
+        if supports_gtp:
+            expected.update(gtp_remat_size=2, expert_gtp_remat_size=4)
+        assert initialized == expected
+
     def test_get_model_executes_weight_hook_and_restores_config(self):
         """Builder construction observes weight-loading and initialization semantics."""
         config = _make_tiny_llama_config()

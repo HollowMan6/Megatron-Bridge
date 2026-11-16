@@ -2445,8 +2445,6 @@ class AutoBridge(Generic[MegatronModelT]):
                 context_parallel_size=transformer_config.context_parallel_size or 1,
                 expert_model_parallel_size=transformer_config.expert_model_parallel_size or 1,
                 expert_tensor_parallel_size=transformer_config.expert_tensor_parallel_size,
-                gtp_remat_size=transformer_config.gtp_weight_remat_size,
-                expert_gtp_remat_size=transformer_config.expert_gtp_weight_remat_size,
             )
             # The GTP weight-rematerialisation axes exist only on megatron-core lines that carry
             # grouped tensor parallelism; a line without them initialises the same groups from the
