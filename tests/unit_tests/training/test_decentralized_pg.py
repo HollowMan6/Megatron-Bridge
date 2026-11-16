@@ -21,6 +21,7 @@ groups are obtained from the pg_collection object rather than the global
 megatron.core.parallel_state module.
 """
 
+import inspect
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -414,6 +415,8 @@ class TestInitializeDistributedRaisesOnNoDevices:
         mock_model_config.tensor_model_parallel_size = 1
         mock_model_config.pipeline_model_parallel_size = 1
         mock_model_config.context_parallel_size = 1
+        mock_model_config.gtp_weight_remat_size = 1
+        mock_model_config.expert_gtp_weight_remat_size = 1
 
         mock_dist_config = MagicMock()
 
@@ -452,6 +455,8 @@ class TestInitializeDistributedBranching:
         mock_model_config.tensor_model_parallel_size = 1
         mock_model_config.pipeline_model_parallel_size = 1
         mock_model_config.context_parallel_size = 1
+        mock_model_config.gtp_weight_remat_size = 1
+        mock_model_config.expert_gtp_weight_remat_size = 1
 
         mock_dist_config = MagicMock()
         mock_dist_config.use_decentralized_pg = True
@@ -481,6 +486,7 @@ class TestInitializeDistributedBranching:
     @patch("megatron.bridge.training.initialize.ProcessGroupCollection")
     @patch("megatron.bridge.training.initialize._create_pg_collection")
     @patch("megatron.bridge.training.initialize.parallel_state")
+    @patch("megatron.bridge.training.initialize.is_gtp_remat_active", return_value=False)
     @patch("torch.cuda.device_count", return_value=1)
     @patch("torch.distributed.is_initialized", return_value=True)
     @patch("megatron.bridge.training.initialize.get_rank_safe", return_value=0)
@@ -489,6 +495,7 @@ class TestInitializeDistributedBranching:
         mock_get_rank,
         mock_is_init,
         mock_device_count,
+        mock_is_gtp_remat_active,
         mock_parallel_state,
         mock_create_pg_collection,
         mock_pg_collection_class,
@@ -507,6 +514,8 @@ class TestInitializeDistributedBranching:
         mock_model_config.hierarchical_context_parallel_sizes = None
         mock_model_config.expert_model_parallel_size = 4
         mock_model_config.expert_tensor_parallel_size = expert_tensor_parallel_size
+        mock_model_config.gtp_weight_remat_size = 2
+        mock_model_config.expert_gtp_weight_remat_size = 3
 
         mock_dist_config = MagicMock()
         mock_dist_config.use_decentralized_pg = False
@@ -519,6 +528,12 @@ class TestInitializeDistributedBranching:
         mock_dist_config.sharp_enabled_group = None
 
         mock_parallel_state.model_parallel_is_initialized.return_value = False
+        mock_parallel_state.initialize_model_parallel.__signature__ = inspect.Signature(
+            parameters=[
+                inspect.Parameter("gtp_remat_size", inspect.Parameter.KEYWORD_ONLY),
+                inspect.Parameter("expert_gtp_remat_size", inspect.Parameter.KEYWORD_ONLY),
+            ]
+        )
         mock_pg_collection = MagicMock()
         mock_pg_collection_class.use_mpu_process_groups.return_value = mock_pg_collection
 
@@ -538,6 +553,42 @@ class TestInitializeDistributedBranching:
             mock_parallel_state.initialize_model_parallel.call_args.kwargs["expert_tensor_parallel_size"]
             == expected_expert_tensor_parallel_size
         )
+        assert mock_parallel_state.initialize_model_parallel.call_args.kwargs["gtp_remat_size"] == 2
+        assert mock_parallel_state.initialize_model_parallel.call_args.kwargs["expert_gtp_remat_size"] == 3
+
+    @patch("megatron.bridge.training.initialize._create_pg_collection")
+    @patch("megatron.bridge.training.initialize.parallel_state")
+    @patch("torch.cuda.device_count", return_value=1)
+    @patch("torch.distributed.is_initialized", return_value=True)
+    @patch("megatron.bridge.training.initialize.get_rank_safe", return_value=0)
+    def test_rejects_gtp_with_decentralized_process_groups(
+        self,
+        mock_get_rank,
+        mock_is_init,
+        mock_device_count,
+        mock_parallel_state,
+        mock_create_pg_collection,
+    ):
+        """GTP must not silently use process groups that lack its remat axes."""
+        from megatron.bridge.training.initialize import _initialize_distributed
+
+        mock_model_config = MagicMock()
+        mock_model_config.expert_tensor_parallel_size = 1
+        mock_model_config.gtp_weight_remat_size = 2
+        mock_model_config.expert_gtp_weight_remat_size = 1
+        mock_dist_config = MagicMock(use_decentralized_pg=True)
+
+        with pytest.raises(NotImplementedError, match="standard MCore process-group runtime"):
+            _initialize_distributed(
+                model_config=mock_model_config,
+                dist_config=mock_dist_config,
+                num_distributed_optimizer_instances=1,
+                get_embedding_ranks=None,
+                get_position_embedding_ranks=None,
+            )
+
+        mock_create_pg_collection.assert_not_called()
+        mock_parallel_state.initialize_model_parallel.assert_not_called()
 
 
 class TestSetupUsesDecentralizedPg:
@@ -636,12 +687,12 @@ class TestSetupOptimizerWithPgCollection:
         assert call_kwargs["pg_collection"] is None
 
     @patch("megatron.bridge.training.optim.get_model_config")
-    @patch("megatron.bridge.training.optim.get_megatron_muon_optimizer")
+    @patch("megatron.bridge.training.optim.get_megatron_optimizer")
     @patch("megatron.bridge.training.optim.OptimizerParamScheduler")
     def test_setup_optimizer_passes_pg_collection_to_muon_optimizer(
-        self, mock_scheduler, mock_get_muon_optimizer, mock_get_model_config
+        self, mock_scheduler, mock_get_optimizer, mock_get_model_config
     ):
-        """Test that setup_optimizer passes pg_collection to muon optimizer."""
+        """Test that setup_optimizer passes pg_collection for Muon construction."""
         from megatron.core.optimizer import OptimizerConfig
 
         from megatron.bridge.training.config import SchedulerConfig
@@ -652,7 +703,7 @@ class TestSetupOptimizerWithPgCollection:
         mock_model = MagicMock()
         mock_pg_collection = MagicMock()
         mock_optimizer = MagicMock()
-        mock_get_muon_optimizer.return_value = mock_optimizer
+        mock_get_optimizer.return_value = mock_optimizer
 
         optimizer_config = OptimizerConfig(optimizer="muon", lr=1e-3)
         scheduler_config = SchedulerConfig()
@@ -666,9 +717,10 @@ class TestSetupOptimizerWithPgCollection:
             pg_collection=mock_pg_collection,
         )
 
-        # Verify pg_collection was passed to muon optimizer
-        mock_get_muon_optimizer.assert_called_once()
-        call_kwargs = mock_get_muon_optimizer.call_args[1]
+        # Verify pg_collection was passed through the unified optimizer factory.
+        mock_get_optimizer.assert_called_once()
+        call_kwargs = mock_get_optimizer.call_args[1]
+        assert call_kwargs["config"] is optimizer_config
         assert call_kwargs["pg_collection"] == mock_pg_collection
 
     @patch("megatron.bridge.training.optim.get_model_config")

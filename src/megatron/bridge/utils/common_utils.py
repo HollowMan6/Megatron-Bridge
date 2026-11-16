@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-import os
 import re
 import types
 import warnings
@@ -23,11 +22,10 @@ from pathlib import Path
 import torch
 import torch.distributed
 from megatron.core import DistributedDataParallel as DDP
-from megatron.core._rank_utils import safe_get_rank as get_rank_safe  # noqa: F401
 from megatron.core._rank_utils import safe_get_world_size as get_world_size_safe  # noqa: F401
+from megatron.core._slurm_utils import resolve_slurm_rank
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_batch_on_this_cp_rank
-from megatron.core._slurm_utils import resolve_slurm_rank
 from megatron.training.utils.common_utils import get_local_rank_preinit  # noqa: F401
 
 from megatron.bridge.training.utils.packed_seq_utils import get_packed_seq_cp_partition_indices
@@ -37,14 +35,14 @@ from megatron.bridge.utils.slurm_utils import (
 )
 
 
-
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
 
-    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, Float16Module)
+    ALL_MODULE_WRAPPER_CLASSNAMES = tuple(
+        wrapper for wrapper in (DDP, torch_FSDP, Float16Module) if isinstance(wrapper, type)
+    )
 except ImportError:
     ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
-
 
 
 def get_rank_safe() -> int:
@@ -58,6 +56,8 @@ def get_rank_safe() -> int:
         return slurm_rank
     warnings.warn("Could not determine rank from torch.distributed, RANK, or SLURM_PROCID. Defaulting to rank 0.")
     return 0
+
+
 def get_last_rank() -> int:
     """Get the last rank in the distributed group"""
     if not torch.distributed.is_initialized():
@@ -304,16 +304,22 @@ def slice_batch_for_context_parallel(
 
     # MCore's THD path slices within each packed sequence rather than across them.
     if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
-        if inputs_embeds is None:
-            raise ValueError("inputs_embeds is required for THD CP slicing")
+        reference_tensor = inputs_embeds
+        if reference_tensor is None:
+            reference_tensor = next(
+                (tensor for tensor in (labels, loss_mask, position_ids) if tensor is not None),
+                None,
+            )
+        if reference_tensor is None:
+            raise ValueError("At least one sequence tensor is required for THD CP slicing")
 
-        seq_len = inputs_embeds.size(1)
+        seq_len = reference_tensor.size(1)
         index = get_packed_seq_cp_partition_indices(
             packed_seq_params,
             total_tokens=seq_len,
             cp_size=cp_size,
             cp_rank=cp_rank,
-            device=inputs_embeds.device,
+            device=reference_tensor.device,
             cp_group=pg_collection.cp,
         )
 

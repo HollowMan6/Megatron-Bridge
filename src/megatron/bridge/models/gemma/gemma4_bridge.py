@@ -32,7 +32,9 @@ import re
 from typing import Any, Mapping
 
 import torch
+from megatron.core.activations import fast_gelu
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.transformer.enums import AttnBackend
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
@@ -51,8 +53,11 @@ from megatron.bridge.models.conversion.transformers_compat import (
     rope_theta_from_hf,
 )
 from megatron.bridge.models.conversion.utils import mcore_to_hf_window_size
+from megatron.bridge.models.gemma.gemma4_builder import gemma4_moe_layer_spec
+from megatron.bridge.models.gemma.gemma4_config import Gemma4DenseModelConfig, Gemma4ModelConfig
 from megatron.bridge.models.gemma.gemma4_provider import Gemma4DenseProvider, Gemma4ModelProvider
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+from megatron.bridge.utils import fusions
 
 
 # Register Gemma4 custom module types for AutoMapping
@@ -98,15 +103,49 @@ def _infer_attn_pattern(layer_types: list[str]) -> tuple[int, int] | list[str]:
     return (len(layer_types), 0)
 
 
-def _layer_types_from_provider(provider: Gemma4ModelProvider | Gemma4DenseProvider) -> list[str]:
+def _attention_config_value(
+    hf_config: Any,
+    layer_type: str,
+    field_name: str,
+    default: Any,
+    *,
+    legacy_field_name: str | None = None,
+) -> Any:
+    """Read an attention field from a concrete HF layer config when available."""
+    layer_types = getattr(hf_config, "layer_types", None)
+    per_layer_config = getattr(hf_config, "per_layer_config", None)
+    if isinstance(layer_types, (list, tuple)) and per_layer_config is not None:
+        try:
+            layer_index = layer_types.index(layer_type)
+        except ValueError:
+            pass
+        else:
+            return getattr(per_layer_config[layer_index], field_name, default)
+
+    # Transformers 5.15 rejects direct reads of fields that vary by layer.
+    # Older configs instead serialize separate flat local/global field names.
+    fallback_name = legacy_field_name or field_name
+    return getattr(hf_config, "__dict__", {}).get(fallback_name, default)
+
+
+# Legacy providers and builder configs describing the same Gemma 4 variant.
+_Gemma4Config = Gemma4ModelProvider | Gemma4DenseProvider | Gemma4ModelConfig | Gemma4DenseModelConfig
+
+
+def _is_dense(config: _Gemma4Config) -> bool:
+    """Return whether a provider or builder config describes a dense Gemma 4 model."""
+    return isinstance(config, (Gemma4DenseProvider, Gemma4DenseModelConfig))
+
+
+def _layer_types_from_provider(provider: _Gemma4Config) -> list[str]:
     """Reconstruct the Hugging Face per-layer attention pattern."""
-    if isinstance(provider, Gemma4DenseProvider):
+    if _is_dense(provider):
         pattern = provider.window_attn_skip_freq
     else:
         pattern = provider.interleaved_attn_pattern
 
     if (
-        not isinstance(provider, Gemma4DenseProvider)
+        not _is_dense(provider)
         and isinstance(pattern, (list, tuple))
         and len(pattern) == 2
         and all(isinstance(value, int) and not isinstance(value, bool) for value in pattern)
@@ -136,9 +175,9 @@ def _layer_types_from_provider(provider: Gemma4ModelProvider | Gemma4DenseProvid
     return layer_types
 
 
-def _rope_parameters_from_provider(provider: Gemma4ModelProvider | Gemma4DenseProvider) -> dict[str, dict]:
+def _rope_parameters_from_provider(provider: _Gemma4Config) -> dict[str, dict]:
     """Reconstruct Gemma 4's dual local/global RoPE configuration."""
-    if isinstance(provider, Gemma4DenseProvider):
+    if _is_dense(provider):
         local_base = provider.sliding_window_rope_base
         global_base = provider.full_attention_rope_base
         global_partial_factor = provider.full_attention_rope_partial_factor
@@ -163,6 +202,70 @@ def _rope_parameters_from_provider(provider: Gemma4ModelProvider | Gemma4DensePr
     }
 
 
+# Gemma 4 dense settings the HF config does not carry; the legacy provider held them as class defaults.
+_GEMMA4_DENSE_DEFAULTS: dict[str, Any] = {
+    "make_vocab_size_divisible_by": 128,
+    "gated_linear_unit": True,
+    "add_bias_linear": False,
+    # fast_gelu == gelu(x, approximate="tanh"), registered as "gelu_pytorch_tanh" for HF export.
+    "activation_func": fast_gelu,
+    "scale_embeddings_by_hidden_size": True,
+    "share_embeddings_and_output_weights": True,
+    "position_embedding_type": "rope",
+    "rotary_percent": 1.0,
+    "attention_dropout": 0.0,
+    "hidden_dropout": 0.0,
+    "fp16": False,
+    "params_dtype": torch.bfloat16,
+    "autocast_dtype": torch.bfloat16,
+    "use_cpu_initialization": False,
+    "num_moe_experts": None,
+    "moe_router_topk": None,
+    "moe_ffn_hidden_size": None,
+}
+
+# Gemma 4 MoE settings the legacy provider held as class defaults; values mapped from HF take precedence.
+_GEMMA4_MOE_DEFAULTS: dict[str, Any] = {
+    "seq_length": 262_144,
+    "position_embedding_type": "rope",
+    "share_embeddings_and_output_weights": True,
+    "normalization": "RMSNorm",
+    "layernorm_zero_centered_gamma": False,
+    "layernorm_epsilon": 1e-6,
+    "interleaved_attn_pattern": (5, 1),
+    "attention_dropout": 0.0,
+    "hidden_dropout": 0.0,
+    "attention_backend": AttnBackend.auto,
+    "global_rotary_percent": 0.25,
+    "gated_linear_unit": True,
+    "add_bias_linear": False,
+    "activation_func": fast_gelu,
+    "num_moe_experts": 128,
+    "moe_router_topk": 8,
+    "moe_ffn_hidden_size": 704,
+    "moe_shared_expert_intermediate_size": 2112,
+    "moe_shared_expert_overlap": False,
+    "moe_shared_expert_gate": False,
+    "moe_grouped_gemm": True,
+    "moe_token_dispatcher_type": "alltoall",
+    "moe_router_load_balancing_type": "aux_loss",
+    "moe_router_pre_softmax": True,
+    "moe_router_dtype": "fp32",
+    "moe_aux_loss_coeff": 0.001,
+    "moe_permute_fusion": True,
+    "moe_layer_freq": 1,
+    "flash_decode": False,
+    "scatter_embedding_sequence_parallel": True,
+    "fp16": False,
+}
+
+# GPTModelProvider defaults that differ from the builder config's, kept so both paths build the same model.
+_GPT_PROVIDER_PARITY_DEFAULTS: dict[str, Any] = {
+    "masked_softmax_fusion": True,
+    "rope_scaling_factor": 1.0,
+}
+
+
 # ---------------------------------------------------------------------------
 # Gemma4Bridge — text-only CausalLM bridge (MoE and Dense)
 # ---------------------------------------------------------------------------
@@ -177,10 +280,21 @@ def _rope_parameters_from_provider(provider: Gemma4ModelProvider | Gemma4DensePr
 class Gemma4Bridge(MegatronModelBridge):
     """Megatron Bridge for Gemma 4 text-only (CausalLM).
 
-    Dispatches to Dense or MoE path based on ``enable_moe_block`` in HF config.
+    Dispatches to Dense or MoE path based on ``enable_moe_block`` in HF config:
+    ``get_model_config()`` returns a ``Gemma4DenseModelConfig`` or ``Gemma4ModelConfig``,
+    and the legacy ``to_megatron_provider()`` the matching provider, both built from
+    the same settings.
     """
 
+    MODEL_CONFIG_CLASS = Gemma4ModelConfig
+    USE_MODEL_CONFIG_FOR_CONVERSION = True
+
     _CONDITIONAL_MOE_FIELDS = frozenset({"num_moe_experts", "moe_router_topk", "moe_ffn_hidden_size"})
+    CONFIG_MAPPING = [
+        mapping
+        for mapping in MegatronModelBridge.CONFIG_MAPPING
+        if mapping[0] not in {"head_dim", "num_key_value_heads"}
+    ]
 
     def _should_map_hf_config_field(self, hf_config: Any, hf_name: str, megatron_name: str, value: Any) -> bool:
         if megatron_name in self._CONDITIONAL_MOE_FIELDS:
@@ -207,17 +321,74 @@ class Gemma4Bridge(MegatronModelBridge):
         text_config = self._text_config()
         return text_config is not None and not getattr(text_config, "enable_moe_block", False)
 
+    def hf_config_to_model_config(self, hf_config: Any) -> Gemma4ModelConfig | Gemma4DenseModelConfig:
+        """Build the dense or MoE Gemma 4 builder config from a Gemma 4 text config."""
+        if self.MODEL_CONFIG_CLASS is None:
+            return super().hf_config_to_model_config(hf_config)
+        config_class = Gemma4ModelConfig if getattr(hf_config, "enable_moe_block", False) else Gemma4DenseModelConfig
+        return self._build_model_config(config_class, self._text_model_config_kwargs(hf_config))
+
+    def _text_model_config_kwargs(self, hf_config: Any) -> dict[str, Any]:
+        """Flat builder config kwargs for a Gemma 4 text config, dense or MoE.
+
+        The vision-language bridge reuses them for its language model. They omit the MoE layer
+        spec, which ``_build_model_config()`` adds for builder configs only.
+        """
+        if not getattr(hf_config, "enable_moe_block", False):
+            self._is_dense = True
+            config_kwargs = {**_GPT_PROVIDER_PARITY_DEFAULTS, **self._dense_config_kwargs(hf_config)}
+            # MegatronModelBridge.hf_config_to_model_config_kwargs() adds these builder defaults on
+            # the MoE path; the dense path maps its fields by hand, so add them here.
+            config_kwargs.update(
+                attention_softmax_in_fp32=False,
+                cross_entropy_loss_fusion=True,
+                deallocate_pipeline_outputs=True,
+                gradient_accumulation_fusion=fusions.can_enable_gradient_accumulation_fusion(),
+            )
+            return config_kwargs
+
+        self._is_dense = False
+        config_kwargs = self._moe_config_kwargs(super().hf_config_to_model_config_kwargs(hf_config), hf_config)
+        for name, value in _GPT_PROVIDER_PARITY_DEFAULTS.items():
+            config_kwargs.setdefault(name, value)
+        return config_kwargs
+
+    def _build_model_config(
+        self,
+        config_class: type[Gemma4ModelConfig] | type[Gemma4DenseModelConfig],
+        config_kwargs: dict[str, Any],
+    ) -> Gemma4ModelConfig | Gemma4DenseModelConfig:
+        """Construct a Gemma 4 builder config, or a subclass of one, from flat kwargs."""
+        if issubclass(config_class, Gemma4ModelConfig):
+            config_kwargs = {**config_kwargs, "transformer_layer_spec": gemma4_moe_layer_spec}
+        transformer_config_class = config_class.transformer_config_class
+        model_kwargs, transformer_kwargs = self._partition_model_config_kwargs(
+            config_kwargs, config_class, transformer_config_class
+        )
+        return config_class(transformer=transformer_config_class(**transformer_kwargs), **model_kwargs)
+
     def _build_dense_provider(self, hf_config) -> Gemma4DenseProvider:
         """Build a Gemma4DenseProvider from HF config."""
+        return Gemma4DenseProvider(**self._dense_config_kwargs(hf_config))
+
+    def _dense_config_kwargs(self, hf_config) -> dict[str, Any]:
+        """Flat dense settings shared by ``Gemma4DenseModelConfig`` and ``Gemma4DenseProvider``."""
         rope_params = getattr(hf_config, "rope_parameters", {}) or {}
         sliding_rope = rope_params.get("sliding_attention", {})
         full_rope = rope_params.get("full_attention", {})
         num_attention_heads = hf_config.num_attention_heads
-        num_query_groups = hf_config.num_key_value_heads
-        num_global_query_groups = getattr(
+        num_query_groups = _attention_config_value(
             hf_config,
-            "num_global_key_value_heads",
+            "sliding_attention",
+            "num_key_value_heads",
+            getattr(hf_config, "__dict__", {}).get("num_key_value_heads", 4),
+        )
+        num_global_query_groups = _attention_config_value(
+            hf_config,
+            "full_attention",
+            "num_key_value_heads",
             num_query_groups,
+            legacy_field_name="num_global_key_value_heads",
         )
 
         self._dense_num_attention_heads = num_attention_heads
@@ -230,14 +401,21 @@ class Gemma4Bridge(MegatronModelBridge):
 
         sliding_window = getattr(hf_config, "sliding_window", 512)
 
-        return Gemma4DenseProvider(
+        return dict(
+            _GEMMA4_DENSE_DEFAULTS,
             num_layers=hf_config.num_hidden_layers,
             hidden_size=hf_config.hidden_size,
             ffn_hidden_size=hf_config.intermediate_size,
             num_attention_heads=num_attention_heads,
             num_query_groups=num_query_groups,
-            kv_channels=getattr(hf_config, "head_dim", 256),
-            global_kv_channels=getattr(hf_config, "global_head_dim", 512),
+            kv_channels=_attention_config_value(hf_config, "sliding_attention", "head_dim", 256),
+            global_kv_channels=_attention_config_value(
+                hf_config,
+                "full_attention",
+                "head_dim",
+                512,
+                legacy_field_name="global_head_dim",
+            ),
             num_global_query_groups=num_global_query_groups,
             seq_length=hf_config.max_position_embeddings,
             vocab_size=hf_config.vocab_size,
@@ -259,53 +437,86 @@ class Gemma4Bridge(MegatronModelBridge):
 
     def _build_moe_provider(self, hf_config) -> Gemma4ModelProvider:
         """Build a Gemma4ModelProvider from HF config (MoE path)."""
-        provider_kwargs = self.hf_config_to_provider_kwargs(hf_config)
-        provider = Gemma4ModelProvider(**provider_kwargs)
-
-        provider.window_size = getattr(hf_config, "sliding_window", 1024)
-        provider.rotary_base = (
-            rope_local_base_freq_from_hf(hf_config),
-            rope_theta_from_hf(hf_config),
+        # Map this text config directly: the vision-language subclass maps its top-level config in
+        # hf_config_to_provider_kwargs().
+        return Gemma4ModelProvider(
+            **self._moe_config_kwargs(super().hf_config_to_provider_kwargs(hf_config), hf_config)
         )
 
-        head_dim = getattr(hf_config, "head_dim", 256)
-        provider.softmax_scale = 1.0
-        provider.kv_channels = head_dim
-        provider.qk_layernorm = True
+    def _moe_config_kwargs(self, base_kwargs: dict[str, Any], hf_config) -> dict[str, Any]:
+        """Add Gemma 4 MoE settings to kwargs mapped from ``CONFIG_MAPPING``.
 
-        provider.global_head_dim = getattr(hf_config, "global_head_dim", 512)
-        provider.num_global_key_value_heads = getattr(hf_config, "num_global_key_value_heads", 2)
-        provider.attention_k_eq_v = getattr(hf_config, "attention_k_eq_v", False)
+        Shared by ``Gemma4ModelConfig`` and ``Gemma4ModelProvider``.
+        """
+        config_kwargs = dict(base_kwargs)
+        config_kwargs["num_query_groups"] = _attention_config_value(
+            hf_config,
+            "sliding_attention",
+            "num_key_value_heads",
+            getattr(hf_config, "__dict__", {}).get("num_key_value_heads", 4),
+        )
+        for name, value in _GEMMA4_MOE_DEFAULTS.items():
+            config_kwargs.setdefault(name, value)
+
+        config_kwargs.update(
+            window_size=getattr(hf_config, "sliding_window", 1024),
+            rotary_base=(rope_local_base_freq_from_hf(hf_config), rope_theta_from_hf(hf_config)),
+            softmax_scale=1.0,
+            kv_channels=_attention_config_value(hf_config, "sliding_attention", "head_dim", 256),
+            qk_layernorm=True,
+            global_head_dim=_attention_config_value(
+                hf_config,
+                "full_attention",
+                "head_dim",
+                512,
+                legacy_field_name="global_head_dim",
+            ),
+            num_global_key_value_heads=_attention_config_value(
+                hf_config,
+                "full_attention",
+                "num_key_value_heads",
+                2,
+                legacy_field_name="num_global_key_value_heads",
+            ),
+            attention_k_eq_v=getattr(hf_config, "attention_k_eq_v", False),
+        )
 
         rope_params = getattr(hf_config, "rope_parameters", {})
         if isinstance(rope_params, dict):
             full_attn_rope = rope_params.get("full_attention", {})
-            provider.global_rotary_percent = full_attn_rope.get("partial_rotary_factor", 0.25)
+            config_kwargs["global_rotary_percent"] = full_attn_rope.get("partial_rotary_factor", 0.25)
 
         layer_types = getattr(hf_config, "layer_types", None)
         if layer_types:
-            provider.interleaved_attn_pattern = _infer_attn_pattern(layer_types)
+            config_kwargs["interleaved_attn_pattern"] = _infer_attn_pattern(layer_types)
 
         if getattr(hf_config, "enable_moe_block", False):
-            provider.num_moe_experts = getattr(hf_config, "num_experts", 128)
-            provider.moe_router_topk = getattr(hf_config, "top_k_experts", 8)
-            provider.moe_ffn_hidden_size = getattr(hf_config, "moe_intermediate_size", 704)
-            provider.moe_shared_expert_intermediate_size = getattr(hf_config, "intermediate_size", 2112)
-            provider.moe_shared_expert_overlap = False
-            provider.moe_shared_expert_gate = False
-            provider.moe_layer_freq = 1
+            config_kwargs.update(
+                num_moe_experts=getattr(hf_config, "num_experts", 128),
+                moe_router_topk=getattr(hf_config, "top_k_experts", 8),
+                moe_ffn_hidden_size=getattr(hf_config, "moe_intermediate_size", 704),
+                moe_shared_expert_intermediate_size=getattr(hf_config, "intermediate_size", 2112),
+                moe_shared_expert_overlap=False,
+                moe_shared_expert_gate=False,
+                moe_layer_freq=1,
+            )
 
-        provider.final_logit_softcapping = getattr(hf_config, "final_logit_softcapping", 30.0)
-        provider.bf16 = True
-        provider.params_dtype = torch.bfloat16
-        provider.autocast_dtype = torch.bfloat16
-        provider.make_vocab_size_divisible_by = 128
-
-        return provider
+        config_kwargs.update(
+            final_logit_softcapping=getattr(hf_config, "final_logit_softcapping", 30.0),
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            autocast_dtype=torch.bfloat16,
+            make_vocab_size_divisible_by=128,
+        )
+        return config_kwargs
 
     @classmethod
-    def megatron_to_hf_config(cls, provider: Gemma4ModelProvider | Gemma4DenseProvider) -> dict:
-        """Preserve Gemma 4 architecture fields affected by provider conversion."""
+    def megatron_to_hf_config(cls, provider: _Gemma4Config) -> dict:
+        """Preserve Gemma 4 architecture fields affected by provider conversion.
+
+        Accepts a legacy provider or a builder config, which exposes its nested
+        transformer fields as attributes.
+        """
         hf_config = super().megatron_to_hf_config(provider)
         dtype = hf_config.pop("torch_dtype", None)
         if dtype is not None:
@@ -320,12 +531,14 @@ class Gemma4Bridge(MegatronModelBridge):
                 "enable_moe_block": is_moe,
                 "final_logit_softcapping": provider.final_logit_softcapping,
                 "global_head_dim": (provider.global_head_dim if is_moe else provider.global_kv_channels),
+                "head_dim": provider.kv_channels,
                 "hidden_size_per_layer_input": getattr(provider, "per_layer_embed_dim", 0),
                 "layer_types": _layer_types_from_provider(provider),
                 "num_kv_shared_layers": getattr(provider, "num_kv_shared_layers", 0),
                 "num_global_key_value_heads": (
                     provider.num_global_key_value_heads if is_moe else provider.num_global_query_groups
                 ),
+                "num_key_value_heads": provider.num_query_groups,
                 "rope_parameters": _rope_parameters_from_provider(provider),
                 "sliding_window": mcore_to_hf_window_size(window_size),
                 "use_double_wide_mlp": getattr(provider, "use_double_wide_mlp", False),
@@ -406,16 +619,23 @@ class Gemma4Bridge(MegatronModelBridge):
                     text_config, "num_attention_heads", getattr(self, "_dense_num_attention_heads", 8)
                 )
                 kv_head_dim = q_weight.shape[0] // num_q_heads
-                num_kv_heads = getattr(text_config, "num_key_value_heads", getattr(self, "_dense_num_query_groups", 2))
+                num_kv_heads = _attention_config_value(
+                    text_config,
+                    "sliding_attention",
+                    "num_key_value_heads",
+                    getattr(self, "_dense_num_query_groups", 2),
+                )
                 layer_match = re.search(r"layers\.(\d+)\.", q_name)
                 layer_types = getattr(text_config, "layer_types", None)
                 if layer_match and layer_types:
                     layer_idx = int(layer_match.group(1))
                     if layer_idx < len(layer_types) and layer_types[layer_idx] == "full_attention":
-                        num_global_kv_heads = getattr(
+                        num_global_kv_heads = _attention_config_value(
                             text_config,
-                            "num_global_key_value_heads",
+                            "full_attention",
+                            "num_key_value_heads",
                             getattr(self, "_dense_num_global_query_groups", None),
+                            legacy_field_name="num_global_key_value_heads",
                         )
                         if num_global_kv_heads is not None:
                             num_kv_heads = num_global_kv_heads

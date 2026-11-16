@@ -75,8 +75,6 @@ _DEFAULT_GPU_COUNT_OVERRIDES = {
     ("llama3_8b", "pretrain", "gb300", "nvfp4", None): 8,
     ("llama3_8b", "pretrain", "h100", "bf16", None): 8,
     ("llama3_8b", "pretrain", "h100", "fp8cs", None): 8,
-    ("nemotronh_56b", "pretrain", "b200", "fp8cs", None): 64,
-    ("nemotronh_56b", "pretrain", "gb300", "fp8cs", None): 64,
     ("qwen3_30b_a3b", "pretrain", "b200", "bf16", None): 8,
     ("qwen3_30b_a3b", "pretrain", "b200", "fp8cs", None): 8,
     ("qwen3_30b_a3b", "pretrain", "gb200", "bf16", None): 8,
@@ -295,14 +293,21 @@ def apply_target_topology_environment(
     model-specific environment stays explicit in the recipe. Explicit
     ``env_vars`` overrides remain final.
     """
+    from megatron.bridge.perf_recipes.environment import HYBRID_EP_ENV_NAMES
+
     topology_names = {
         "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN",
         "NVLINK_DOMAIN_SIZE",
         "USE_MNNVL",
     }
     protected = protected_env_names or set()
-    if getattr(config.model, "moe_flex_dispatcher_backend", None) != "hybridep":
-        for name in topology_names - protected:
+    dispatcher_backend = getattr(config.model, "moe_flex_dispatcher_backend", None)
+    if dispatcher_backend != "hybridep":
+        # NCCL EP also drops the HybridEP tuning this function never derives, so an NCCL EP launch
+        # carries no stale HybridEP settings at all. DeepEP and alltoall keep whatever the recipe
+        # set, exactly as before.
+        stale_names = HYBRID_EP_ENV_NAMES if dispatcher_backend == "ncclep" else topology_names
+        for name in stale_names - protected:
             config.env_vars.pop(name, None)
         return
 
@@ -319,7 +324,7 @@ def apply_target_topology_environment(
             "NVLINK_DOMAIN_SIZE": 8,
             "USE_MNNVL": 0,
         }
-    elif normalized_gpu in {"gb200", "gb300", "vr200", "r100"}:
+    elif normalized_gpu in {"gb200", "gb300", "vrnvl72", "r100"}:
         if expert_model_parallel_size > 72:
             raise ValueError("HybridEP expert parallel size must not exceed the 72-rank NVLink domain.")
         topology = {
@@ -357,8 +362,9 @@ def apply_argparse_overrides(config: Any, args: Any) -> Any:
     The bootstrap and training entrypoints call this helper before Hydra
     overrides so parallelism and environment-relevant settings match.
     """
-    if getattr(args, "nccl_ub", False):
-        config.ddp.nccl_ub = True
+    nccl_ub = getattr(args, "nccl_ub", None)
+    if nccl_ub is not None:
+        config.ddp.nccl_ub = nccl_ub
 
     # Keep all parallelism overrides together so bootstrap topology and the
     # final training config resolve the same user input.
@@ -388,9 +394,9 @@ def apply_argparse_overrides(config: Any, args: Any) -> Any:
 
     dispatcher_backend = getattr(args, "moe_flex_dispatcher_backend", -1)
     num_moe_experts = getattr(config.model, "num_moe_experts", None)
-    if dispatcher_backend in {"deepep", "hybridep"} and num_moe_experts not in {None, 0}:
+    if dispatcher_backend in {"deepep", "hybridep", "ncclep"} and num_moe_experts not in {None, 0}:
         config.model.moe_flex_dispatcher_backend = dispatcher_backend
-    elif dispatcher_backend in {"deepep", "hybridep"}:
+    elif dispatcher_backend in {"deepep", "hybridep", "ncclep"}:
         logger.warning("Ignoring flex dispatcher override for a model without MoE experts.")
     elif dispatcher_backend is None:
         config.model.moe_flex_dispatcher_backend = None
@@ -414,7 +420,7 @@ def finalize_config_overrides(config: Any) -> Any:
 
     dispatcher_backend = getattr(config.model, "moe_flex_dispatcher_backend", None)
     num_moe_experts = getattr(config.model, "num_moe_experts", None)
-    if dispatcher_backend in {"deepep", "hybridep"} and num_moe_experts not in {None, 0}:
+    if dispatcher_backend in {"deepep", "hybridep", "ncclep"} and num_moe_experts not in {None, 0}:
         config.model.moe_token_dispatcher_type = "flex"
         config.model.moe_shared_expert_overlap = False
     elif dispatcher_backend is None and getattr(config.model, "moe_token_dispatcher_type", None) == "flex":
@@ -831,8 +837,13 @@ def get_perf_optimized_recipe(
     config_variant: str | None = None,
     optimizer_type: str | None = None,
     num_gpus: int | None = None,
+    launch_num_gpus: int | None = None,
 ):
-    """Get a performance optimized recipe from flat perf recipes."""
+    """Get a performance optimized recipe from flat perf recipes.
+
+    ``num_gpus`` selects an exact-count recipe. ``launch_num_gpus`` supplies
+    the actual allocation when resizing the canonical Ultra HSDP recipe.
+    """
     del model_family_name, mock
     recipe_name = _first_matching_perf_recipe_name(
         model_recipe_name=model_recipe_name,
@@ -845,7 +856,12 @@ def get_perf_optimized_recipe(
     recipe_fn = find_perf_recipe(recipe_name)
     if recipe_fn is None:
         raise ValueError(f"No perf recipe {recipe_name!r} found.")
-    cfg = recipe_fn()
+    # The canonical Ultra recipe is also the weak-scaling seed. Resolve HSDP
+    # from the launch allocation before applying explicit user overrides.
+    if model_recipe_name == "nemotron_3_ultra" and launch_num_gpus is not None:
+        cfg = recipe_fn(num_gpus=launch_num_gpus)
+    else:
+        cfg = recipe_fn()
     if optimizer_type == "adam" and model_recipe_name == "kimi_k2":
         from megatron.bridge.recipes.kimi.kimi_k2 import _apply_kimi_k2_optimizer
 

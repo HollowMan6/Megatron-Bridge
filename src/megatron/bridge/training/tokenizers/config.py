@@ -61,18 +61,6 @@ class TokenizerConfig(MTrainTokenizerConfig):
         }
     """
 
-    sp_tokenizer_kwargs: dict[str, Any] | None = field(default_factory=dict)
-    """Additional keyword arguments to pass to SentencePiece tokenizer.
-
-    Common options include:
-        - legacy (bool): Whether to use legacy format of sentencepiece tokenizer
-
-    Example:
-        sp_tokenizer_kwargs = {
-            "legacy": True,
-        }
-    """
-
     chat_template_path: Optional[str] = None
     """Path to a jinja chat template file, loaded at build time as ``chat_template``. Supports local
     paths and ``msc://`` URLs. Mutually exclusive with ``chat_template``. Useful for supplying a
@@ -80,12 +68,11 @@ class TokenizerConfig(MTrainTokenizerConfig):
     impractical."""
 
     tokenizer_prompt_format: Optional[str] = None
-    """Prompt format for the tokenizer."""
+    """Prompt format for the tokenizer.
 
-    @property
-    def sft_tokenizer_prompt_format(self) -> str | None:
-        """Expose the prompt-format name expected by MCore's SFT tokenizer builder."""
-        return self.tokenizer_prompt_format
+    This is Bridge's canonical prompt-format setting. When set, it also populates the inherited
+    MCore ``sft_tokenizer_prompt_format`` field that MCore's SFT tokenizer builder reads.
+    """
 
     image_tag_type: Optional[str] = None
     """Image tag to apply, if any. For example <img><image></img>."""
@@ -97,6 +84,11 @@ class TokenizerConfig(MTrainTokenizerConfig):
         # Don't pad vocab size since MBridge does it's own padding
         self.pad_vocab_size = False
 
+        # MCore's SFT tokenizer builder reads ``sft_tokenizer_prompt_format``; keep it in sync with
+        # Bridge's canonical ``tokenizer_prompt_format`` when that is set.
+        if self.tokenizer_prompt_format is not None:
+            self.sft_tokenizer_prompt_format = self.tokenizer_prompt_format
+
         # HuggingFace tokenizer kwargs
         self.tokenizer_hf_no_use_fast = not self.hf_tokenizer_kwargs.get("use_fast", True)
         self.tokenizer_hf_no_include_special_tokens = not self.hf_tokenizer_kwargs.get("include_special_tokens", True)
@@ -106,12 +98,4 @@ class TokenizerConfig(MTrainTokenizerConfig):
                 "`hf_tokenizer_kwargs` is deprecated and will be removed soon. "
                 "Please, use `tokenizer_hf_no_use_fast` / `tokenizer_hf_no_include_special_tokens` / "
                 "`trust_remote_code` arguments directly instead."
-            )
-
-        # SentencePiece tokenizer kwargs
-        self.tokenizer_sentencepiece_legacy = self.sp_tokenizer_kwargs.get("legacy", False)
-        if self.sp_tokenizer_kwargs:
-            warn_rank_0(
-                "`sp_tokenizer_kwargs` is deprecated and will be removed soon. "
-                "Please, use `tokenizer_sentencepiece_legacy` (bool) argument directly instead."
             )

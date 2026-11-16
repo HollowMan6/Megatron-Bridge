@@ -20,7 +20,6 @@ from megatron.bridge.perf_recipes.qwen.common import (
     CommOverlapConfig,
     ConfigContainer,
     _benchmark_common,
-    _enable_overlap_param_gather_with_optimizer_step,
     _perf_precision,
     _with_global_batch_size,
     qwen3_30b_a3b_pretrain_config,
@@ -89,7 +88,6 @@ def qwen3_30b_a3b_pretrain_16gpu_h100_fp8cs_config() -> ConfigContainer:
 
     cfg.model.moe_flex_dispatcher_backend = "hybridep"
     cfg.model.moe_token_dispatcher_type = "flex"
-    cfg.model.moe_a2a_overlap = False
 
     cfg.model.cuda_graph_impl = "transformer_engine"
     cfg.model.cuda_graph_scope = ["attn", "moe_router", "moe_preprocess"]
@@ -157,7 +155,6 @@ def qwen3_235b_a22b_pretrain_256gpu_h100_bf16_config() -> ConfigContainer:
 
     cfg.model.moe_flex_dispatcher_backend = None
     cfg.model.moe_token_dispatcher_type = "alltoall"
-    cfg.model.moe_a2a_overlap = True
     cfg.model.moe_shared_expert_overlap = False
 
     cfg.comm_overlap = CommOverlapConfig(
@@ -167,7 +164,6 @@ def qwen3_235b_a22b_pretrain_256gpu_h100_bf16_config() -> ConfigContainer:
     )
 
     _benchmark_common(cfg)
-    _enable_overlap_param_gather_with_optimizer_step(cfg)
     # Keep process settings next to the recipe so users can see the exact benchmark environment.
     cfg.env_vars = {
         **COMMON_PERF_ENV_VARS,
@@ -210,7 +206,6 @@ def qwen3_235b_a22b_pretrain_256gpu_h100_fp8cs_config() -> ConfigContainer:
 
     cfg.model.moe_flex_dispatcher_backend = None
     cfg.model.moe_token_dispatcher_type = "alltoall"
-    cfg.model.moe_a2a_overlap = True
     cfg.model.moe_shared_expert_overlap = False
 
     cfg.comm_overlap = CommOverlapConfig(
@@ -220,7 +215,6 @@ def qwen3_235b_a22b_pretrain_256gpu_h100_fp8cs_config() -> ConfigContainer:
     )
 
     _benchmark_common(cfg)
-    _enable_overlap_param_gather_with_optimizer_step(cfg)
     # Keep process settings next to the recipe so users can see the exact benchmark environment.
     cfg.env_vars = {
         **COMMON_PERF_ENV_VARS,

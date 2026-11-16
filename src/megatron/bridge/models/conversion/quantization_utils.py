@@ -345,9 +345,7 @@ def write_blockwise_fp8_param(
     # "destination columnwise scale grid (10, 256) is smaller than the grid the checkpoint
     # carries (12, 256)" — the "checkpoint" there was this intermediate padded grid.
     logical_scale = scale
-    rowwise_scale = _pad_scale_grid_to(
-        target_scale, logical_scale, param_name=param_name, label="rowwise scale grid"
-    )
+    rowwise_scale = _pad_scale_grid_to(target_scale, logical_scale, param_name=param_name, label="rowwise scale grid")
     param._rowwise_data = data
     param._rowwise_scale_inv = rowwise_scale
     if getattr(param, "_columnwise_data", None) is not None:
@@ -629,13 +627,22 @@ def _quantize_fp8_1d_scale(
 
     q_weight = torch.empty_like(weight_f32, dtype=torch.float8_e4m3fn)
     scale_f32 = torch.empty(scale_len, dtype=torch.float32, device=weight.device)
-    for block_idx in range(scale_len):
-        row_start = block_idx * block_size
-        row_end = min(row_start + block_size, rows)
-        block = weight_f32[row_start:row_end]
-        block_scale = scale_from_amax(block.abs().amax().reshape(()), FP8_E4M3_MAX, source_scale.dtype)
-        q_weight[row_start:row_end] = (block / block_scale).to(torch.float8_e4m3fn)
-        scale_f32[block_idx] = block_scale
+    num_full_blocks = rows // block_size
+    if num_full_blocks > 0:
+        full_blocks = weight_f32[: num_full_blocks * block_size].view(num_full_blocks, block_size, -1)
+        full_amax = full_blocks.abs().amax(dim=(1, 2)).reshape(-1)
+        full_scale = scale_from_amax(full_amax, FP8_E4M3_MAX, source_scale.dtype)
+        q_weight[: num_full_blocks * block_size] = (
+            (full_blocks / full_scale[:, None, None]).to(torch.float8_e4m3fn).view(num_full_blocks * block_size, -1)
+        )
+        scale_f32[:num_full_blocks] = full_scale
+    if num_full_blocks < scale_len:
+        # Tail block (fewer than ``block_size`` rows): identical amax over the
+        # present rows only, matching the original ``min(row_start+block_size, rows)``.
+        tail = weight_f32[num_full_blocks * block_size :]
+        tail_scale = scale_from_amax(tail.abs().amax().reshape(()), FP8_E4M3_MAX, source_scale.dtype)
+        q_weight[num_full_blocks * block_size :] = (tail / tail_scale).to(torch.float8_e4m3fn)
+        scale_f32[num_full_blocks] = tail_scale
     return q_weight.contiguous(), scale_f32.to(dtype=source_scale.dtype)
 
 
@@ -779,8 +786,7 @@ def dequantize_block_scaled_fp8(
     if scale_f32.dim() == 1:
         if scale_f32.shape[0] != weight_f32.shape[0]:
             raise RuntimeError(
-                f"Unsupported 1-D FP8 scale geometry{label}: weight={tuple(weight.shape)} "
-                f"scale={tuple(scale.shape)}"
+                f"Unsupported 1-D FP8 scale geometry{label}: weight={tuple(weight.shape)} scale={tuple(scale.shape)}"
             )
         scale_exp = scale_f32.unsqueeze(1).expand_as(weight_f32)
     elif scale_f32.dim() == 2 and scale_f32.shape[0] == weight_f32.shape[0]:
@@ -790,9 +796,7 @@ def dequantize_block_scaled_fp8(
         scale_exp = scale_f32.repeat_interleave(block_size, dim=0)[: weight_f32.shape[0]]
         scale_exp = scale_exp.repeat_interleave(block_size, dim=1)[:, : weight_f32.shape[1]]
     else:
-        raise RuntimeError(
-            f"Unsupported FP8 scale rank{label}: scale={tuple(scale.shape)}"
-        )
+        raise RuntimeError(f"Unsupported FP8 scale rank{label}: scale={tuple(scale.shape)}")
     return (weight_f32 * scale_exp).to(dtype)
 
 
@@ -829,16 +833,12 @@ def requantize_to_blockwise_fp8(
     if mxfp4:
         dequantized = dequantize_mxfp4_e2m1_packed(weight, scale, dtype=torch.float32)
     else:
-        dequantized = dequantize_block_scaled_fp8(
-            weight, scale, name=name, block_size=block_size, dtype=torch.float32
-        )
+        dequantized = dequantize_block_scaled_fp8(weight, scale, name=name, block_size=block_size, dtype=torch.float32)
     rows, cols = dequantized.shape
     scale_rows = (rows + target_block - 1) // target_block
     scale_cols = (cols + target_block - 1) // target_block
     template = torch.empty((scale_rows, scale_cols), dtype=torch.float32, device=dequantized.device)
-    q_weight, scale_f32 = _quantize_fp8_2d_blocks(
-        dequantized, template, name=name, block_size=target_block
-    )
+    q_weight, scale_f32 = _quantize_fp8_2d_blocks(dequantized, template, name=name, block_size=target_block)
     return Fp8BlockwisePair(
         data=as_fp8_bytes(q_weight).contiguous(),
         scale_inv=scale_f32.to(torch.float32).contiguous(),

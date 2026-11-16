@@ -30,6 +30,7 @@ from megatron.bridge.peft.lora_layers import (
     LoRALinear,
     LoRATopKRouter,
     TEFusedLoRALinear,
+    TEFusedLoRAMergeLinear,
 )
 from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.peft.utils import (
@@ -243,6 +244,7 @@ class LoRA(PEFT, ModuleMatcher):
             needs no flag: it is a plain single-pair target, so listing it in
             ``target_modules`` is enough. Default False keeps the fused
             single-pair topology.
+        use_transformer_engine_op_fuser (bool): Enable Transformer Engine fusion only for LoRA wrappers.
     """
 
     target_modules: List[str] = field(
@@ -262,6 +264,7 @@ class LoRA(PEFT, ModuleMatcher):
     experts_shared_outer_loras: bool = False
     split_gate_up_adapters: bool = False
     split_qkv_adapters: bool = False
+    use_transformer_engine_op_fuser: bool = False
 
     def __call__(self, model, training: bool = True):
         """Apply LoRA, promoting targeted parameter-backed projections first.
@@ -409,9 +412,7 @@ class LoRA(PEFT, ModuleMatcher):
                     attrs.out_features,
                     getattr(module.config, "tensor_model_parallel_size", 1) or 1,
                 )
-                if self.split_qkv_adapters
-                and not is_grouped_expert_name
-                and str(full_name).endswith("in_proj")
+                if self.split_qkv_adapters and not is_grouped_expert_name and str(full_name).endswith("in_proj")
                 else None
             )
             use_split_in_proj_adapter = gdn_block_layout is not None
@@ -421,8 +422,10 @@ class LoRA(PEFT, ModuleMatcher):
                 and not use_split_gate_up_adapter
                 and not use_split_qkv_adapter
                 and not use_split_in_proj_adapter
-                and not is_expert
-                and getattr(module.config, "use_transformer_engine_op_fuser", False)
+                and (
+                    self.use_transformer_engine_op_fuser
+                    or getattr(module.config, "use_transformer_engine_op_fuser", False)
+                )
                 # TP not yet supported
                 and parallel_state.get_tensor_model_parallel_world_size() == 1
             )
@@ -464,6 +467,7 @@ class LoRA(PEFT, ModuleMatcher):
                     sequence_parallel_input_regather=self.sequence_parallel_input_regather,
                     disable_tensor_parallel_comm=attrs.disable_tensor_parallel_comm,
                     disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
+                    replicate_adapter=attrs.replicate_adapter,
                 )
             if use_split_qkv_adapter:
                 # ``qkv_head_layout`` is keyword-only on SplitQKVAdapter, and the
@@ -487,6 +491,8 @@ class LoRA(PEFT, ModuleMatcher):
             if isinstance(module, TopKRouter):
                 return LoRATopKRouter(module, adapter)
             if enable_op_fuser:
+                if is_expert:
+                    return TEFusedLoRAMergeLinear(module, adapter)
                 return TEFusedLoRALinear(module, adapter)
             else:
                 return LoRALinear(module, adapter)

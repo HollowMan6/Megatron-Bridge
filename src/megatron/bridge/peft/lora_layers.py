@@ -83,9 +83,7 @@ class LoRALinear(AdapterWrapper):
         if hasattr(self.adapter, "merged_weight"):
             # Split gate/up adapters hold two pairs and merge each against its
             # own row slice of the fused base weight.
-            merged_weight = self.adapter.merged_weight(
-                base_weight, getattr(self.adapter, "tp_group", None)
-            )
+            merged_weight = self.adapter.merged_weight(base_weight, getattr(self.adapter, "tp_group", None))
             if merged_weight.shape != base_weight.shape:
                 raise RuntimeError(
                     "LoRA effective weight shape mismatch: "
@@ -130,10 +128,24 @@ class LoRALinear(AdapterWrapper):
             (e.g. a plain ``nn.Linear``), a bare tensor so the wrapper stays a
             drop-in replacement in simple (non-parallel) models.
         """
-        # pylint: disable=C0115,C0116
         linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
         if not self._adapter_enabled:
             return linear_output if not self._base_returns_tuple else (linear_output, bias)
+
+        # Preserve the fork's opt-in for a known fresh, owned base output. Views
+        # and aliased storage keep the safe clone path from dev. Clone before
+        # computing the adapter so the normal path retains only two full-width
+        # branch buffers instead of allocating a third one for the final add.
+        import os as _os_lora
+
+        owns_storage = (
+            linear_output._base is None
+            and linear_output.untyped_storage().nbytes() == linear_output.numel() * linear_output.element_size()
+        )
+        inplace_delta = _os_lora.environ.get("MINT_LORA_NO_CLONE") == "1" and owns_storage
+        combined_output = linear_output if inplace_delta else linear_output.clone()
+        del linear_output
+
         adapter_input = layernorm_output.contiguous()
         adapter_param = next(self.adapter.parameters(), None)
         if (
@@ -143,34 +155,16 @@ class LoRALinear(AdapterWrapper):
         ):
             adapter_input = adapter_input.to(dtype=adapter_param.dtype)
         adapter_output = self.adapter_forward(self.adapter, adapter_input, *args, **kwargs)
-        adapter_output = adapter_output.reshape(linear_output.shape)
-        # Opt-in long-context relief: adding into the base output in place drops the
-        # third full-width buffer that the out-of-place add allocates (measured
-        # 1.06-4.57 GiB per adapted layer at long-context row counts). A view cannot
-        # be marked dirty inside a custom Function, so views keep the default path.
-        # The in-place form is only correct when ``linear_output`` is a fresh
-        # activation: nothing else may read the pre-add value, and no producer
-        # backward may have saved it. A view cannot be marked dirty at all, and a
-        # view into a larger buffer would alias memory this module does not own,
-        # so require both "not a view" and "own storage". A producer that *saved*
-        # its output is caught by autograd's version counter (it raises rather than
-        # returning wrong gradients), but an alias made outside autograd's view
-        # (``.data``, a custom op) would not be -- so this stays opt-in and is
-        # meant for a known producer (a TE grouped/fused linear), not as a general
-        # default. The default below is main's out-of-place add.
-        import os as _os_lora
-        owns_storage = (
-            linear_output._base is None
-            and linear_output.untyped_storage().nbytes()
-            == linear_output.numel() * linear_output.element_size()
-        )
-        if _os_lora.environ.get("MINT_LORA_NO_CLONE") == "1" and owns_storage:
-            combined = _InplaceDeltaAdd.apply(linear_output, adapter_output)
+        adapter_output = adapter_output.reshape(combined_output.shape)
+        if adapter_output.dtype != combined_output.dtype:
+            adapter_output = adapter_output.to(dtype=combined_output.dtype)
+        if inplace_delta:
+            combined_output = _InplaceDeltaAdd.apply(combined_output, adapter_output)
         else:
-            combined = linear_output + adapter_output
+            combined_output.add_(adapter_output)
         if not self._base_returns_tuple:
-            return combined
-        return combined, bias
+            return combined_output
+        return combined_output, bias
 
 
 class LoRATopKRouter(AdapterWrapper):
@@ -301,7 +295,6 @@ class TEFusedLoRALinear(LoRALinear):
             else:
                 raise ValueError(f"Unsupported normalization ({norm_type})")
             main_branch.append(op)
-            main_branch.append(te.ops.Quantize(forward=True, backward=False))
 
         # Fork to LoRA branch
         # Note: GEMM with beta=1 in backward pass
@@ -429,6 +422,43 @@ class TEFusedLoRALinear(LoRALinear):
         with te.fp8_autocast(enabled=False):
             out = lora_branch(linear_input, linear_output)
         return out, None
+
+
+class TEFusedLoRAMergeLinear(TEFusedLoRALinear):
+    """Fuse the LoRA output projection into an existing base-linear output."""
+
+    def __init__(self, to_wrap: nn.Module, adapter: nn.Module):
+        super().__init__(to_wrap, adapter)
+        self._fused_lora_branches: Optional[tuple[te.ops.Sequential]] = None
+
+    def _make_fused_lora_branch(self) -> te.ops.Sequential:
+        """Construct the LoRA branch without rebuilding the base linear."""
+        return self._make_lora_branch(
+            in_features=self.adapter.linear_in.weight.size(1),
+            out_features=self.adapter.linear_out.weight.size(0),
+            tensor_parallel_mode=None,
+            tensor_parallel_group=None,
+            sequence_parallel=False,
+            accumulate_into_main_grad=False,
+        )
+
+    def forward(
+        self, x: torch.Tensor, *args: Any, **kwargs: Any
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the base linear, then fuse the LoRA B GEMM into its output."""
+        if not self._adapter_enabled:
+            return LoRALinear.forward(self, x, *args, **kwargs)
+
+        linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
+        if self._fused_lora_branches is None:
+            # A tuple avoids registering the fused view of the adapter weights as another submodule.
+            self._fused_lora_branches = (self._make_fused_lora_branch(),)
+
+        with te.fp8_autocast(enabled=False):
+            combined = self._fused_lora_branches[0](layernorm_output.contiguous(), linear_output)
+        if not self._base_returns_tuple:
+            return combined
+        return combined, bias
 
 
 class LinearAdapter(nn.Module):

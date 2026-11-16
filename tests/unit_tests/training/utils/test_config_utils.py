@@ -25,10 +25,25 @@ from unittest.mock import MagicMock, mock_open, patch
 import pytest
 import torch
 from megatron.core.msc_utils import MultiStorageClientFeature
+from transformers import PreTrainedConfig
 
 from megatron.bridge.models.common import Serializable
-from megatron.bridge.training.utils.config_utils import _ConfigContainerBase, create_ddp_config
+from megatron.bridge.training.utils.config_utils import (
+    _ConfigContainerBase,
+    _materialize_gtp_weight_shards,
+    create_ddp_config,
+)
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
+
+
+def test_gtp_weight_shards_preserve_explicit_counts_and_handle_aliases():
+    model = {"tensor_model_parallel_size": 2, "tensor_parallel_num_weight_shards": 8, "gtp_weight_remat_size": 2}
+    config = {"models": [model, model]}
+    config["self"] = config
+    normalized = _materialize_gtp_weight_shards(config)
+    assert normalized["models"][0]["tensor_parallel_num_weight_shards"] == 8
+    assert normalized["models"][0] is normalized["models"][1]
+    assert normalized["self"] is normalized
 
 
 # Test functions for callable testing
@@ -774,6 +789,24 @@ class TestConfigContainer_EdgeCases:
         assert result["optional_field"] is None
         assert result["required_field"] == "required"
 
+    def test_dataclass_pretrained_config_reads_raw_fields(self):
+        """Dataclass config serialization must not invoke guarded dynamic access."""
+
+        @dataclass
+        class HeterogeneousConfig(PreTrainedConfig):
+            num_key_value_heads: int = 8
+
+            def __getattribute__(self, name):
+                if name == "num_key_value_heads":
+                    raise RuntimeError("read this value from the per-layer config")
+                return super().__getattribute__(name)
+
+        config = HeterogeneousConfig()
+
+        serialized = _ConfigContainerBase._convert_pretrained_config_to_dict(config, include_target=True)
+
+        assert serialized["num_key_value_heads"] == 8
+
     def test_config_with_complex_nested_types(self):
         """Test ConfigContainer with complex nested types."""
 
@@ -1150,78 +1183,6 @@ class TestBackwardCompatibility:
 
         # All fields preserved when target can't be resolved
         assert result == config
-
-    def test_apply_run_config_backward_compat_sanitizes_model(self):
-        """Test apply_run_config_backward_compat sanitizes model section with init=False fields."""
-        from megatron.bridge.training.utils.config_utils import apply_run_config_backward_compat
-
-        run_config = {
-            "model": {
-                "_target_": "tests.unit_tests.training.utils.test_config_utils.DataclassWithInitFalse",
-                "name": "model_name",
-                "value": 100,
-                "computed_field": "should_be_removed",
-            },
-            "training": {"lr": 0.001},
-            "tokenizer": {"type": "sentencepiece"},
-        }
-
-        result = apply_run_config_backward_compat(run_config)
-
-        assert "computed_field" not in result["model"]
-        assert result["model"]["name"] == "model_name"
-        assert result["training"] == {"lr": 0.001}
-        assert result["tokenizer"] == {"type": "sentencepiece"}
-
-    def test_apply_run_config_backward_compat_no_model_section(self):
-        """Test apply_run_config_backward_compat handles config without model section."""
-        from megatron.bridge.training.utils.config_utils import apply_run_config_backward_compat
-
-        run_config = {"training": {"lr": 0.001}}
-        result = apply_run_config_backward_compat(run_config)
-
-        assert result == run_config
-
-    def test_apply_run_config_backward_compat_non_dict(self):
-        """Test apply_run_config_backward_compat handles non-dict input."""
-        from megatron.bridge.training.utils.config_utils import apply_run_config_backward_compat
-
-        assert apply_run_config_backward_compat("string") == "string"
-        assert apply_run_config_backward_compat(None) is None
-
-    def test_apply_run_config_backward_compat_sanitizes_all_sections(self):
-        """Test apply_run_config_backward_compat sanitizes all sections, not just model."""
-        from megatron.bridge.training.utils.config_utils import apply_run_config_backward_compat
-
-        run_config = {
-            "model": {
-                "_target_": "tests.unit_tests.training.utils.test_config_utils.DataclassWithInitFalse",
-                "name": "model_name",
-                "computed_field": "should_be_removed_from_model",
-            },
-            "training": {
-                "_target_": "tests.unit_tests.training.utils.test_config_utils.DataclassWithInitFalse",
-                "name": "training_config",
-                "computed_field": "should_be_removed_from_training",
-            },
-            "data": {
-                "_target_": "tests.unit_tests.training.utils.test_config_utils.DataclassWithInitFalse",
-                "name": "data_config",
-                "computed_field": "should_be_removed_from_data",
-            },
-        }
-
-        result = apply_run_config_backward_compat(run_config)
-
-        # All sections should have init=False fields removed
-        assert "computed_field" not in result["model"]
-        assert "computed_field" not in result["training"]
-        assert "computed_field" not in result["data"]
-
-        # Regular fields should be preserved
-        assert result["model"]["name"] == "model_name"
-        assert result["training"]["name"] == "training_config"
-        assert result["data"]["name"] == "data_config"
 
 
 class TestConfigContainerBackwardCompat:

@@ -14,7 +14,7 @@
 
 import logging
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -30,7 +30,6 @@ if TYPE_CHECKING:
 
 
 @dataclass(kw_only=True)
-
 class MixedPrecisionConfig:
     """Mixed precision configuration for models.
 
@@ -51,6 +50,8 @@ class MixedPrecisionConfig:
     fp8_recipe: str = (
         "tensorwise"  # "tensorwise", "delayed", "mxfp8" (for Blackwell only), "blockwise" (for Hopper only)
     )
+    fp8_recipe_attrs: Optional[dict[str, Any]] = None
+    fp8_quantizer_factory: Optional[str] = None
     first_last_layers_bf16: bool = False
     fp8_margin: int = 0
     fp8_amax_history_len: int = 1
@@ -63,6 +64,8 @@ class MixedPrecisionConfig:
     # fp4 related
     fp4: Optional[str] = None
     fp4_recipe: str = "nvfp4"
+    fp4_recipe_attrs: Optional[dict[str, Any]] = None
+    fp4_quantizer_factory: Optional[str] = None
     fp4_param: Optional[bool] = None
     fp4_param_gather: bool = False
     # FP16 Loss scaling
@@ -134,8 +137,6 @@ class MixedPrecisionConfig:
         # Update DDP config if provided
         if ddp_config is not None:
             ddp_config = update_config_with_precision_overrides(self, ddp_config)
-
-
 
 
 def update_config_with_precision_overrides(mixed_precision_config: MixedPrecisionConfig, config):

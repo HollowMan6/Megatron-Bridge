@@ -15,6 +15,7 @@
 """Hybrid model provider for Multi-Latent Attention."""
 
 from dataclasses import dataclass
+from typing import Any
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.transformer.experimental_attention_variant.dsa import (
@@ -54,21 +55,26 @@ def _validate_dsa_pipeline_segments(main_pattern: str, *, topk_freq: int, skip_t
 def _add_dsa_pipeline_separators(
     pattern: str,
     *,
-    pipeline_model_parallel_size: int,
+    num_pipeline_segments: int,
     topk_freq: int,
     skip_topk_offset: int,
 ) -> str:
-    """Add balanced pipeline separators before full-indexer DSA layers."""
+    """Add balanced pipeline separators before full-indexer DSA layers.
+
+    ``num_pipeline_segments`` counts every model chunk: pipeline stages times
+    virtual stages. Megatron-Core assigns segment ``vp_stage * pp_size + pp_rank``
+    to each chunk.
+    """
     main_pattern, separator, mtp_pattern = pattern.partition(Symbols.MTP_SEPARATOR)
-    if Symbols.DS_ATTENTION not in main_pattern or pipeline_model_parallel_size <= 1:
+    if Symbols.DS_ATTENTION not in main_pattern or num_pipeline_segments <= 1:
         return pattern
 
     if Symbols.PIPE in main_pattern:
         num_segments = main_pattern.count(Symbols.PIPE) + 1
-        if num_segments != pipeline_model_parallel_size:
+        if num_segments != num_pipeline_segments:
             raise ValueError(
-                f"hybrid_layer_pattern defines {num_segments} pipeline segments, but "
-                f"pipeline_model_parallel_size is {pipeline_model_parallel_size}."
+                f"hybrid_layer_pattern defines {num_segments} pipeline segments, but the pipeline "
+                f"needs {num_pipeline_segments} (pipeline stages x virtual pipeline stages)."
             )
         _validate_dsa_pipeline_segments(
             main_pattern,
@@ -84,20 +90,20 @@ def _add_dsa_pipeline_separators(
         and layer_type == Symbols.DS_ATTENTION
         and not is_dsa_skip_topk_layer(layer_idx + 1, skip_topk_offset, topk_freq)
     ]
-    required_boundaries = pipeline_model_parallel_size - 1
+    required_boundaries = num_pipeline_segments - 1
     if len(candidate_boundaries) < required_boundaries:
         raise ValueError(
-            "Cannot split Hybrid MLA layers across pipeline stages without crossing a DSA "
+            "Cannot split Hybrid MLA layers into pipeline segments without crossing a DSA "
             f"IndexShare group: found {len(candidate_boundaries)} valid boundaries for "
-            f"pipeline_model_parallel_size={pipeline_model_parallel_size}."
+            f"{num_pipeline_segments} segments."
         )
 
     selected_boundaries = []
     candidate_start = 0
-    for stage_idx in range(1, pipeline_model_parallel_size):
-        remaining_boundaries = pipeline_model_parallel_size - stage_idx - 1
+    for segment_idx in range(1, num_pipeline_segments):
+        remaining_boundaries = num_pipeline_segments - segment_idx - 1
         choices = candidate_boundaries[candidate_start : len(candidate_boundaries) - remaining_boundaries]
-        target = len(main_pattern) * stage_idx / pipeline_model_parallel_size
+        target = len(main_pattern) * segment_idx / num_pipeline_segments
         boundary = min(choices, key=lambda candidate: (abs(candidate - target), candidate))
         selected_boundaries.append(boundary)
         candidate_start = candidate_boundaries.index(boundary, candidate_start) + 1
@@ -115,34 +121,49 @@ def _add_dsa_pipeline_separators(
     return segmented_pattern + (separator + mtp_pattern if separator else "")
 
 
+def apply_dsa_pipeline_separators(config: Any) -> None:
+    """Place DSA-safe pipeline separators in a Hybrid MLA layer pattern.
+
+    Works on a ``HybridMLAModelProvider`` or a builder-backed Hybrid model config, which
+    exposes the nested transformer settings as flat attributes. Run it before the Hybrid
+    finalization, which appends the MTP pattern and derives ``num_layers``.
+
+    Args:
+        config: Provider or model config with a Hybrid layer pattern and DSA settings.
+
+    Raises:
+        ValueError: If explicit first/last stage layer counts are set, or the pattern cannot
+            be split into one segment per model chunk without crossing a DSA IndexShare group.
+    """
+    pattern_attr = "hybrid_layer_pattern"
+    pattern = config.hybrid_layer_pattern
+    if pattern is None and config.hybrid_override_pattern is not None:
+        pattern_attr = "hybrid_override_pattern"
+        pattern = config.hybrid_override_pattern
+
+    main_pattern = pattern.split(Symbols.MTP_SEPARATOR)[0] if pattern is not None else ""
+    num_pipeline_segments = config.pipeline_model_parallel_size * (config.virtual_pipeline_model_parallel_size or 1)
+    if Symbols.DS_ATTENTION not in main_pattern or num_pipeline_segments <= 1:
+        return
+    if config.num_layers_in_first_pipeline_stage is not None or config.num_layers_in_last_pipeline_stage is not None:
+        raise ValueError(
+            "Hybrid MLA derives pipeline stages from hybrid_layer_pattern; "
+            "num_layers_in_first_pipeline_stage and num_layers_in_last_pipeline_stage are unsupported."
+        )
+    pattern = _add_dsa_pipeline_separators(
+        pattern,
+        num_pipeline_segments=num_pipeline_segments,
+        topk_freq=config.dsa_indexer_topk_freq or 1,
+        skip_topk_offset=config.dsa_indexer_skip_topk_offset or 0,
+    )
+    setattr(config, pattern_attr, pattern)
+
+
 @dataclass
 class HybridMLAModelProvider(HybridModelProvider, MLATransformerConfig):
     """Provider for Hybrid models using Multi-Latent Attention."""
 
     def finalize(self) -> None:
         """Finalize the provider after adding DSA-safe pipeline segments."""
-        pattern_attr = "hybrid_layer_pattern"
-        pattern = self.hybrid_layer_pattern
-        if pattern is None and self.hybrid_override_pattern is not None:
-            pattern_attr = "hybrid_override_pattern"
-            pattern = self.hybrid_override_pattern
-
-        main_pattern = pattern.split(Symbols.MTP_SEPARATOR)[0] if pattern is not None else ""
-        if Symbols.DS_ATTENTION in main_pattern and self.pipeline_model_parallel_size > 1:
-            if (
-                self.num_layers_in_first_pipeline_stage is not None
-                or self.num_layers_in_last_pipeline_stage is not None
-            ):
-                raise ValueError(
-                    "Hybrid MLA derives pipeline stages from hybrid_layer_pattern; "
-                    "num_layers_in_first_pipeline_stage and num_layers_in_last_pipeline_stage are unsupported."
-                )
-            pattern = _add_dsa_pipeline_separators(
-                pattern,
-                pipeline_model_parallel_size=self.pipeline_model_parallel_size,
-                topk_freq=self.dsa_indexer_topk_freq or 1,
-                skip_topk_offset=self.dsa_indexer_skip_topk_offset or 0,
-            )
-            setattr(self, pattern_attr, pattern)
-
+        apply_dsa_pipeline_separators(self)
         super().finalize()

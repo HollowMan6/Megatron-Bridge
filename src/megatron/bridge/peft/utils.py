@@ -536,20 +536,6 @@ def _ensure_model_list(model: ModelList | MegatronModule) -> ModelList:
 def is_modelopt_linear(m: nn.Module) -> bool:
     """Return whether a module is ModelOpt's local Megatron Linear."""
     return HAVE_MODELOPT_LINEAR and isinstance(m, ModelOptLinear)
-def init_method_uniform(bound: float) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Create an initialization method based on uniform distribution U(-bound, bound).
-
-    Args:
-        bound: Half-width of the uniform distribution.
-
-    Returns:
-        Initialization function that applies the uniform distribution to a tensor.
-    """
-
-    def init_(tensor: torch.Tensor) -> torch.Tensor:
-        return nn.init.uniform_(tensor, -bound, bound)
-
-    return init_
 
 
 @dataclass(frozen=True)
@@ -562,6 +548,7 @@ class AdapterAttributes:
     disable_tensor_parallel_comm: bool
     disable_sequence_parallel_comm: bool
     base_linear_is_parallel: bool
+    replicate_adapter: bool = False
 
 
 def get_adapter_attributes_from_linear(
@@ -598,6 +585,7 @@ def get_adapter_attributes_from_linear(
     """
     disable_sequence_parallel_comm = not m.config.sequence_parallel
     base_linear_is_parallel = True
+    replicate_adapter = False
 
     # In some modules (notably MoE shared_experts when moe_shared_expert_overlap is enabled),
     # Megatron disables TP-related communications on the base linear layer by
@@ -676,6 +664,7 @@ def get_adapter_attributes_from_linear(
         in_features = m.in_features
         out_features = m.out_features
         base_linear_is_parallel = False
+        replicate_adapter = True
     elif isinstance(m, ColumnParallelLinear):
         input_is_parallel = False
         in_features = m.input_size
@@ -694,6 +683,7 @@ def get_adapter_attributes_from_linear(
         disable_tensor_parallel_comm=disable_tensor_parallel_comm,
         disable_sequence_parallel_comm=disable_sequence_parallel_comm,
         base_linear_is_parallel=base_linear_is_parallel,
+        replicate_adapter=replicate_adapter,
     )
 
 
@@ -784,7 +774,7 @@ def wildcard_match(pattern: str, key: Optional[str]) -> Optional[bool]:
     """
     if key is None:
         return None
-    regex_pattern = re.compile("^" + pattern.replace("*", "(.*)") + "$")
+    regex_pattern = re.compile("^" + pattern.replace(".", r"\.").replace("*", "(.*)") + "$")
     match = regex_pattern.match(key)
     return match is not None
 
@@ -817,6 +807,22 @@ def init_method_kaiming_uniform(val: float) -> Callable[[torch.Tensor], torch.Te
 
     def init_(tensor: torch.Tensor) -> torch.Tensor:
         return nn.init.kaiming_uniform_(tensor, a=val)
+
+    return init_
+
+
+def init_method_uniform(bound: float) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Create an initialization method based on uniform distribution U(-bound, bound).
+
+    Args:
+        bound: Half-width of the uniform distribution.
+
+    Returns:
+        Initialization function that applies the uniform distribution to a tensor.
+    """
+
+    def init_(tensor: torch.Tensor) -> torch.Tensor:
+        return nn.init.uniform_(tensor, -bound, bound)
 
     return init_
 
@@ -1135,6 +1141,7 @@ class ParallelLinearAdapter(nn.Module):
         is_expert: Whether this adapter is for expert layers in MoE (default: False).
         disable_sequence_parallel_comm: Whether to disable sequence parallel communication (default: True).
         base_linear_is_parallel: Whether the base linear layer uses parallelization (default: True).
+        replicate_adapter: Whether both low-rank matrices should be duplicated across TP ranks.
         sequence_parallel_input_regather: Whether eligible LoRA-A projections retain the sequence-local input and
             re-gather it in backward using MCore's sequence-parallel linear path (default: False).
     """
@@ -1158,6 +1165,7 @@ class ParallelLinearAdapter(nn.Module):
         disable_tensor_parallel_comm: bool = False,
         disable_sequence_parallel_comm: bool = True,
         base_linear_is_parallel: bool = True,
+        replicate_adapter: bool = False,
         pg_collection: ProcessGroupCollection | None = None,
         sequence_parallel_input_regather: bool = False,
     ) -> None:
@@ -1180,6 +1188,7 @@ class ParallelLinearAdapter(nn.Module):
             is_expert: Whether for expert layers in MoE.
             disable_tensor_parallel_comm: Disable tensor parallel communication.
             disable_sequence_parallel_comm: Disable sequence parallel communication.
+            replicate_adapter: Duplicate both low-rank matrices across TP ranks.
             sequence_parallel_input_regather: Re-gather eligible LoRA-A sequence-parallel inputs in backward.
         """
         super().__init__()
@@ -1192,6 +1201,7 @@ class ParallelLinearAdapter(nn.Module):
         self.use_a2a = a2a_experimental
         self.is_expert = is_expert
         self.base_linear_is_parallel = base_linear_is_parallel
+        self.replicate_adapter = replicate_adapter
         self.sequence_parallel_input_regather = sequence_parallel_input_regather
         self._sequence_parallel_input_regather_fallback_logged = False
         self.use_legacy_shared_expert_adapter_checkpoint = False
@@ -1211,14 +1221,43 @@ class ParallelLinearAdapter(nn.Module):
         self.ep_group = _get_process_group(self.pg_collection, "ep")
         self.expert_dp_group = _get_process_group(self.pg_collection, "expt_dp")
         _sequence_parallel = model_parallel_config.sequence_parallel
-        model_parallel_config.sequence_parallel = False  # SP is irrelevant for the lora linear layer
         self.config = model_parallel_config
 
         # Ensure adapter parameters are initialized when creating adapter layers.
         # In some flows (e.g., after import), perform_initialization may be False to skip heavy init.
         model_parallel_config.perform_initialization = True
 
-        if input_is_parallel:
+        if replicate_adapter:
+            if is_expert:
+                raise ValueError("Replicated adapters are only supported for non-expert linears")
+            if not HAVE_TE:
+                raise RuntimeError("Replicated adapters require Transformer Engine")
+            self.linear_in = TELinear(
+                in_features,
+                dim,
+                parallel_mode="duplicated",
+                config=model_parallel_config,
+                init_method=self._get_init_fn(column_init_method),
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                tp_group=None,
+            )
+            self.linear_out = TELinear(
+                dim,
+                out_features,
+                parallel_mode="duplicated",
+                config=model_parallel_config,
+                init_method=self._get_init_fn(row_init_method),
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                tp_group=None,
+            )
+        else:
+            model_parallel_config.sequence_parallel = False  # SP is irrelevant for TP-sharded LoRA linears
+
+        if not replicate_adapter and input_is_parallel:
             self.linear_in = RowParallelLinear(
                 in_features,
                 dim,
@@ -1230,7 +1269,7 @@ class ParallelLinearAdapter(nn.Module):
                 is_expert=is_expert,
                 tp_group=self.tp_group,
             )
-        else:
+        elif not replicate_adapter:
             self.linear_in = ColumnParallelLinear(
                 in_features,
                 dim,
@@ -1247,28 +1286,29 @@ class ParallelLinearAdapter(nn.Module):
         # a column parallel layer with two low-rank column parallel layers
         # if the original column parallel layer uses gather_output=False,
         # then we will use the self.liner_out layer defined below.
-        lin_out_gather_output = True if input_is_parallel else False
-        if (
-            self.use_a2a
-            and input_is_parallel
-            and _sequence_parallel
-            or (disable_tensor_parallel_comm and not input_is_parallel)
-        ):
-            lin_out_gather_output = False
+        if not replicate_adapter:
+            lin_out_gather_output = True if input_is_parallel else False
+            if (
+                self.use_a2a
+                and input_is_parallel
+                and _sequence_parallel
+                or (disable_tensor_parallel_comm and not input_is_parallel)
+            ):
+                lin_out_gather_output = False
 
-        if not base_linear_is_parallel:
-            lin_out_gather_output = True
+            if not base_linear_is_parallel:
+                lin_out_gather_output = True
 
-        self.linear_out = ColumnParallelLinear(
-            dim,
-            out_features,
-            config=model_parallel_config,
-            bias=False,
-            gather_output=lin_out_gather_output,
-            init_method=self._get_init_fn(row_init_method, fan_in=dim, fan_out=out_features),
-            is_expert=is_expert,
-            tp_group=self.tp_group,
-        )
+            self.linear_out = ColumnParallelLinear(
+                dim,
+                out_features,
+                config=model_parallel_config,
+                bias=False,
+                gather_output=lin_out_gather_output,
+                init_method=self._get_init_fn(row_init_method, fan_in=dim, fan_out=out_features),
+                is_expert=is_expert,
+                tp_group=self.tp_group,
+            )
 
         if dropout > 0.0:
             self.dropout = nn.Dropout(dropout)
@@ -1286,7 +1326,8 @@ class ParallelLinearAdapter(nn.Module):
             self._register_shared_expert_grad_sync_hooks()
 
         # revert config change in case it is read elsewhere
-        model_parallel_config.sequence_parallel = _sequence_parallel
+        if not replicate_adapter:
+            model_parallel_config.sequence_parallel = _sequence_parallel
         self.disable_sequence_parallel_comm = disable_sequence_parallel_comm
         if not _sequence_parallel:
             self.disable_sequence_parallel_comm = True
@@ -1435,7 +1476,7 @@ class ParallelLinearAdapter(nn.Module):
             x, pad_len = pad_seq_to_mult(x, self.config.expert_tensor_parallel_size)
 
         use_sequence_parallel_input_regather, fallback_reason = self._sequence_parallel_input_regather_eligibility(x)
-        if not self.input_is_parallel:
+        if not self.input_is_parallel and not self.replicate_adapter:
             # MCore's SP linear keeps the local input in ctx, launches the
             # backward all-gather asynchronously before dgrad, and waits only
             # before wgrad. The baseline path keeps communication external.
@@ -1458,6 +1499,7 @@ class ParallelLinearAdapter(nn.Module):
             x, _ = self.linear_in(x)
 
         x = self.activation(x)
+        x = x * (self.alpha / self.dim)
 
         if self.config.cpu_offloading and self.config.cpu_offloading_activations:
             x.activation_offloading = True
@@ -1477,8 +1519,6 @@ class ParallelLinearAdapter(nn.Module):
         # Add dropout if available
         if self.dropout_position == "post":
             x = self.dropout(x)
-
-        x = x * (self.alpha / self.dim)
 
         if pad_len > 0:
             # Remove MoE padding.
@@ -1986,10 +2026,7 @@ class SplitGateUpAdapter(ParallelLinearAdapter):
                 for both pairs.
         """
         if out_features % 2 != 0:
-            raise ValueError(
-                "SplitGateUpAdapter requires an even fused output dim "
-                f"(gate + up), got {out_features}"
-            )
+            raise ValueError(f"SplitGateUpAdapter requires an even fused output dim (gate + up), got {out_features}")
         super().__init__(in_features, out_features // 2, dim, **kwargs)
         self.up = ParallelLinearAdapter(in_features, out_features // 2, dim, **kwargs)
 
@@ -2130,7 +2167,10 @@ class SplitQKVAdapter(ParallelLinearAdapter):
 
         model_parallel_config = kwargs.get("model_parallel_config")
         tp_size = int(getattr(model_parallel_config, "tensor_model_parallel_size", 1) or 1)
-        if tp_size < 1:
+        # Duplicated (non-TP) base linears keep all q/k/v rows on every TP rank.
+        # Their split adapters must use the same full layout rather than divide
+        # the head/block geometry by the surrounding model's TP size.
+        if kwargs.get("replicate_adapter", False) or tp_size < 1:
             tp_size = 1
 
         if qkv_block_layout is not None:
@@ -2226,9 +2266,7 @@ class SplitQKVAdapter(ParallelLinearAdapter):
         if v_dim <= 0:
             raise ValueError(f"SplitQKVAdapter: v_dim must be positive, got {v_dim}")
         if extra_features_dim < 0:
-            raise ValueError(
-                f"SplitQKVAdapter: extra_features_dim must be >= 0, got {extra_features_dim}"
-            )
+            raise ValueError(f"SplitQKVAdapter: extra_features_dim must be >= 0, got {extra_features_dim}")
 
         face_total = 2 * qk_dim + v_dim + extra_features_dim
         if face_total != out_features and face_total != out_features * tp_size:
@@ -2244,8 +2282,7 @@ class SplitQKVAdapter(ParallelLinearAdapter):
         for name, width in (("qk_dim", qk_dim), ("v_dim", v_dim), ("extra_features_dim", extra_features_dim)):
             if width % tp_size:
                 raise ValueError(
-                    f"SplitQKVAdapter: {name}={width} must be divisible by "
-                    f"tensor_model_parallel_size={tp_size}"
+                    f"SplitQKVAdapter: {name}={width} must be divisible by tensor_model_parallel_size={tp_size}"
                 )
 
         self._qkv_layout_mode = "blocked"
@@ -2273,9 +2310,7 @@ class SplitQKVAdapter(ParallelLinearAdapter):
             return torch.cat([query, key, value, zeros], dim=-1)
         return self._interleave_qkv(query, key, value)
 
-    def _interleave_qkv(
-        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
-    ) -> torch.Tensor:
+    def _interleave_qkv(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         """Pack per-rank q/k/v deltas into megatron's packed per-group ordering.
 
         Port of ``LoRALinearSplitQKV._interleave_qkv``
@@ -2292,9 +2327,7 @@ class SplitQKVAdapter(ParallelLinearAdapter):
         query_width, key_width, value_width = query.shape[-1], key.shape[-1], value.shape[-1]
         for name, width in (("query", query_width), ("key", key_width), ("value", value_width)):
             if width % head_size != 0:
-                raise ValueError(
-                    f"SplitQKVAdapter: {name} width {width} is not divisible by head_size {head_size}"
-                )
+                raise ValueError(f"SplitQKVAdapter: {name} width {width} is not divisible by head_size {head_size}")
 
         local_heads = query_width // head_size
         local_groups = key_width // head_size
@@ -2354,9 +2387,7 @@ class SplitQKVAdapter(ParallelLinearAdapter):
         return q_indices, k_indices, v_indices
 
     @staticmethod
-    def blocked_face_row_indices(
-        qk_local: int, v_local: int
-    ) -> Tuple[List[int], List[int], List[int]]:
+    def blocked_face_row_indices(qk_local: int, v_local: int) -> Tuple[List[int], List[int], List[int]]:
         """Return the fused-layout row indices of each face in blocked mode.
 
         The block-concatenated fused weight is ``[q (qk_local); k (qk_local);
@@ -2370,9 +2401,7 @@ class SplitQKVAdapter(ParallelLinearAdapter):
         v_indices = list(range(2 * qk_local, 2 * qk_local + v_local))
         return q_indices, k_indices, v_indices
 
-    def face_row_indices_for_layout(
-        self, num_fused_rows: int
-    ) -> Tuple[List[int], List[int], List[int]]:
+    def face_row_indices_for_layout(self, num_fused_rows: int) -> Tuple[List[int], List[int], List[int]]:
         """Return each face's row indices in the fused base weight's own layout.
 
         Mode-aware entry point for the merge path: ``num_fused_rows`` is the
@@ -2417,9 +2446,7 @@ class SplitQKVAdapter(ParallelLinearAdapter):
 
     def pairs(
         self,
-    ) -> Tuple[
-        Tuple[nn.Module, nn.Module], Tuple[nn.Module, nn.Module], Tuple[nn.Module, nn.Module]
-    ]:
+    ) -> Tuple[Tuple[nn.Module, nn.Module], Tuple[nn.Module, nn.Module], Tuple[nn.Module, nn.Module]]:
         """Return ((q_in, q_out), (k_in, k_out), (v_in, v_out)) for init/export seams."""
         return (
             (self.linear_in, self.linear_out),
@@ -2577,8 +2604,13 @@ class GroupedExpertLinearAdapter(nn.Module):
 
         linear_in_weight = torch.empty(linear_in_shape, device=params_device, dtype=dtype)
         linear_out_weight = torch.empty(linear_out_shape, device=params_device, dtype=dtype)
-        ParallelLinearAdapter._get_init_fn(self, column_init_method)(linear_in_weight)
-        ParallelLinearAdapter._get_init_fn(self, row_init_method)(linear_out_weight)
+        # The weights are stacked per-expert matrices. Resolve the fan-dependent
+        # init methods from the full (unsharded) per-expert dims: a fan read off
+        # the 3-D tensor would scale with ``dim * in_features`` and with the
+        # number of local experts, so the init would depend on EP/ETP size and
+        # start far too small (see ``_get_init_fn``).
+        ParallelLinearAdapter._get_init_fn(self, column_init_method, fan_in=in_features, fan_out=dim)(linear_in_weight)
+        ParallelLinearAdapter._get_init_fn(self, row_init_method, fan_in=dim, fan_out=out_features)(linear_out_weight)
 
         use_expert_process_groups = (
             _process_group_size(
@@ -2782,86 +2814,69 @@ class GroupedExpertLinearAdapter(nn.Module):
                 grad_weight_quantizers,
                 grad_output_quantizers,
             ) = ([quantizers[expert_idx] for expert_idx in active_expert_indices] for quantizers in quantizer_groups)
-            common_non_tensor_args = (
-                helper.apply_bias,
-                None,
-                helper.fp8,
-                helper.fp8_calibration,
-                helper.wgrad_store,
-                input_quantizers,
-                weight_quantizers,
-                output_quantizers,
-                grad_input_quantizers,
-                grad_weight_quantizers,
-                grad_output_quantizers,
-                helper.fuse_wgrad_accumulation,
-                TEPytorchIsCPUOffloadEnabled(),
-                helper.sequence_parallel,
-                helper.activation_dtype,
-                torch.is_grad_enabled(),
-            )
             empty_biases = [x.new_empty(0) for _ in range(weight.shape[0])]
             weights_and_biases = (*[weight[i] for i in range(weight.shape[0])], *empty_biases)
 
             # TODO: Replace this private FP8 dispatch once Transformer Engine exposes
             # a public functional grouped-linear API for externally owned weights
             # (NVIDIA/TransformerEngine#3191).
+            non_tensor_arg_names = _te_grouped_linear_non_tensor_arg_names(TEPytorchGroupedLinearAutograd)
+            if not non_tensor_arg_names:
+                raise RuntimeError("Unable to determine Transformer Engine grouped-linear argument layout")
+            te_non_tensor_values = {
+                "m_splits": m_splits,
+                "use_bias": helper.apply_bias,
+                "is_first_microbatch": None,
+                "fp8": helper.fp8,
+                "fp8_calibration": helper.fp8_calibration,
+                "wgrad_store": helper.wgrad_store,
+                "input_quantizers": input_quantizers,
+                "weight_quantizers": weight_quantizers,
+                "output_quantizers": output_quantizers,
+                "grad_input_quantizers": grad_input_quantizers,
+                "grad_weight_quantizers": grad_weight_quantizers,
+                "grad_output_quantizers": grad_output_quantizers,
+                "fuse_wgrad_accumulation": helper.fuse_wgrad_accumulation,
+                "cpu_offloading": TEPytorchIsCPUOffloadEnabled(),
+                "sequence_parallel": helper.sequence_parallel,
+                "activation_dtype": helper.activation_dtype,
+                "is_grad_enabled": torch.is_grad_enabled(),
+                "module": helper,
+                "weight_workspaces": [None] * weight.shape[0],
+                "cache_weight": False,
+                "skip_fp8_weight_update": None,
+                "save_original_input": helper.save_original_input,
+                "delayed_scaling_input_quantizer": getattr(helper, "_delayed_scaling_input_quantizer", None),
+                "unsafe_requantization_input_quantizer": getattr(
+                    helper, "_unsafe_requantization_input_quantizer", None
+                ),
+                "debug": False,
+                # Adapter weights and empty biases are passed separately per expert.
+                "single_grouped_weight": False,
+                "single_grouped_bias": False,
+                # Keep the existing discrete-tensor kernel path with CPU splits.
+                "use_grouped_tensor": False,
+                # ROCm Transformer Engine unpacks these extra optional fields from
+                # ``non_tensor_args``; CUDA builds never name them, so the entries
+                # stay inert there (the tuple is assembled from TE's own field names).
+                "m_splits_tensor": None,
+                "actual_m_splits": None,
+                "unpad_output": False,
+            }
+            unknown_arg_names = set(non_tensor_arg_names) - te_non_tensor_values.keys()
+            if unknown_arg_names:
+                raise RuntimeError(
+                    f"Unsupported Transformer Engine grouped-linear arguments: {sorted(unknown_arg_names)}"
+                )
+            te_non_tensor_args = tuple(te_non_tensor_values[name] for name in non_tensor_arg_names)
             explicit_m_splits = _te_grouped_linear_uses_explicit_m_splits(TEPytorchGroupedLinearAutograd)
             if explicit_m_splits:
                 te_m_splits = torch.tensor(m_splits, dtype=torch.int64, device="cpu")
-                te_non_tensor_args = (
-                    *common_non_tensor_args,
-                    [None] * weight.shape[0],
-                    False,
-                    None,
-                    helper.save_original_input,
-                    False,
-                )
                 output_buffers = (
                     (None, None) if _te_grouped_linear_uses_output_buffers(TEPytorchGroupedLinearAutograd) else ()
                 )
-                autograd_args = (
-                    x,
-                    te_m_splits,
-                    te_non_tensor_args,
-                    *output_buffers,
-                    *weights_and_biases,
-                )
+                autograd_args = (x, te_m_splits, te_non_tensor_args, *output_buffers, *weights_and_biases)
             else:
-                non_tensor_arg_names = _te_grouped_linear_non_tensor_arg_names(TEPytorchGroupedLinearAutograd)
-                if not non_tensor_arg_names:
-                    raise RuntimeError("Unable to determine Transformer Engine grouped-linear argument layout")
-                te_non_tensor_values = {
-                    "m_splits": m_splits,
-                    "use_bias": helper.apply_bias,
-                    "is_first_microbatch": None,
-                    "fp8": helper.fp8,
-                    "fp8_calibration": helper.fp8_calibration,
-                    "wgrad_store": helper.wgrad_store,
-                    "input_quantizers": input_quantizers,
-                    "weight_quantizers": weight_quantizers,
-                    "output_quantizers": output_quantizers,
-                    "grad_input_quantizers": grad_input_quantizers,
-                    "grad_weight_quantizers": grad_weight_quantizers,
-                    "grad_output_quantizers": grad_output_quantizers,
-                    "fuse_wgrad_accumulation": helper.fuse_wgrad_accumulation,
-                    "cpu_offloading": TEPytorchIsCPUOffloadEnabled(),
-                    "sequence_parallel": helper.sequence_parallel,
-                    "activation_dtype": helper.activation_dtype,
-                    "is_grad_enabled": torch.is_grad_enabled(),
-                    "module": helper,
-                    "weight_workspaces": [None] * weight.shape[0],
-                    "cache_weight": False,
-                    "skip_fp8_weight_update": None,
-                    "save_original_input": helper.save_original_input,
-                    "debug": False,
-                }
-                unknown_arg_names = set(non_tensor_arg_names) - te_non_tensor_values.keys()
-                if unknown_arg_names:
-                    raise RuntimeError(
-                        f"Unsupported Transformer Engine grouped-linear arguments: {sorted(unknown_arg_names)}"
-                    )
-                te_non_tensor_args = tuple(te_non_tensor_values[name] for name in non_tensor_arg_names)
                 autograd_args = (x, te_non_tensor_args, *weights_and_biases)
 
             if torch.is_grad_enabled():
@@ -2931,6 +2946,10 @@ class GroupedExpertLinearAdapter(nn.Module):
             if not self.input_is_parallel:
                 hidden = self._gather_along_last_dim(hidden)
             hidden = self.activation(hidden)
+            # Scale the rank-sized bottleneck rather than the full-width output. The
+            # output projection is bias-free, so this is exact and avoids allocating
+            # a second output-sized temporary.
+            hidden = hidden * (self.alpha / self.dim)
 
             if self.config.cpu_offloading and self.config.cpu_offloading_activations:
                 hidden.activation_offloading = True
@@ -2972,9 +2991,7 @@ class GroupedExpertLinearAdapter(nn.Module):
         use_te_fp8 = fp8_enabled and self._can_use_te_grouped_linear_fp8(x)
         use_grouped_mm = not fp8_enabled and self._can_use_grouped_mm(x)
         if not use_te_fp8 and not use_grouped_mm:
-            return self._forward_per_expert(x, expert_splits=expert_splits, expert_tp_size=expert_tp_size) * (
-                self.alpha / self.dim
-            )
+            return self._forward_per_expert(x, expert_splits=expert_splits, expert_tp_size=expert_tp_size)
 
         active_expert_indices = []
         grouped_inputs = []
@@ -3013,6 +3030,10 @@ class GroupedExpertLinearAdapter(nn.Module):
         if not self.input_is_parallel:
             hidden = self._gather_along_last_dim(hidden)
         hidden = self.activation(hidden)
+        # Scale the rank-sized bottleneck rather than the full-width output. The
+        # grouped output projection is bias-free, so this is exact and avoids
+        # allocating a second output-sized temporary.
+        hidden = hidden * (self.alpha / self.dim)
 
         if self.config.cpu_offloading and self.config.cpu_offloading_activations:
             hidden.activation_offloading = True
@@ -3033,7 +3054,7 @@ class GroupedExpertLinearAdapter(nn.Module):
             expert_output = self.dropout(expert_output)
 
         if all(pad_len == 0 for pad_len in pad_lengths):
-            return expert_output * (self.alpha / self.dim)
+            return expert_output
 
         outputs = []
         start = 0
@@ -3042,7 +3063,7 @@ class GroupedExpertLinearAdapter(nn.Module):
             outputs.append(unpad_seq_to_mult(output_chunk, pad_len) if pad_len > 0 else output_chunk)
             start += padded_size
 
-        return torch.cat(outputs, dim=0) * (self.alpha / self.dim)
+        return torch.cat(outputs, dim=0)
 
     def sharded_state_dict(
         self,
@@ -3112,6 +3133,7 @@ class PackedPerExpertLinear(nn.Module):
         init_method: Optional[Callable] = None,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
+        pg_collection: ProcessGroupCollection | None = None,
     ):
         super().__init__()
         if not hasattr(torch, "_grouped_mm"):
@@ -3119,6 +3141,7 @@ class PackedPerExpertLinear(nn.Module):
         self.num_local_experts = num_local_experts
         self.in_features = in_features
         self.out_features = out_features
+        self.pg_collection = pg_collection
         weight = torch.empty(num_local_experts, out_features, in_features, dtype=dtype, device=device)
         if init_method is not None:
             for e in range(num_local_experts):
@@ -3158,7 +3181,11 @@ class PackedPerExpertLinear(nn.Module):
         key = f"{prefix}weight"
         return {
             key: _make_grouped_expert_sharded_tensor(
-                self.weight.data, key, tp_axis=None, sharded_offsets=sharded_offsets
+                self.weight.data,
+                key,
+                tp_axis=None,
+                sharded_offsets=sharded_offsets,
+                pg_collection=self.pg_collection,
             )
         }
 
@@ -3238,8 +3265,11 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         # :class:`GroupedExpertLinearAdapter`.
         self._is_fc1 = not input_is_parallel
 
-        column_init = ParallelLinearAdapter._get_init_fn(self, column_init_method)
-        row_init = ParallelLinearAdapter._get_init_fn(self, row_init_method)
+        # Full per-matrix fans: the shared side is a TP-sharded Megatron linear
+        # (initialized per shard) and the per-expert side is initialized one
+        # expert matrix at a time, so both resolve to the same fixed scale.
+        column_init = ParallelLinearAdapter._get_init_fn(self, column_init_method, fan_in=in_features, fan_out=dim)
+        row_init = ParallelLinearAdapter._get_init_fn(self, row_init_method, fan_in=dim, fan_out=out_features)
         if self._is_fc1:
             # Shared A (hidden → rank); per-expert B (rank → 2*intermediate).
             self.linear_in = ColumnParallelLinear(
@@ -3258,6 +3288,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
                 init_method=row_init,
                 device=params_device,
                 dtype=params_dtype,
+                pg_collection=self.pg_collection,
             )
         else:
             # Per-expert A (intermediate → rank); shared B (rank → hidden).
@@ -3268,6 +3299,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
                 init_method=column_init,
                 device=params_device,
                 dtype=params_dtype,
+                pg_collection=self.pg_collection,
             )
             self.linear_out = RowParallelLinear(
                 dim,
@@ -3299,21 +3331,27 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         if self.dropout_position == "pre":
             x = self.dropout(x)
 
+        # Scale the rank-sized bottleneck rather than the full-width output. Both
+        # output projections are bias-free, so this is exact and avoids allocating
+        # a second output-sized temporary.
+        scale = self.alpha / self.dim
         if self._is_fc1:
             # Shared A → activation → per-expert B.
             x, _ = self.linear_in(x)
             x = self.activation(x)
+            x = x * scale
             x, _ = self.linear_out(x, m_splits)
         else:
             # Per-expert A → activation → shared B.
             x, _ = self.linear_in(x, m_splits)
             x = self.activation(x)
+            x = x * scale
             x, _ = self.linear_out(x)
 
         if self.dropout_position == "post":
             x = self.dropout(x)
 
-        return x * (self.alpha / self.dim)
+        return x
 
     def sharded_state_dict(
         self,

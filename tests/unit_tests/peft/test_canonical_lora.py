@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import datetime
+import math
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,9 +23,10 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 
-from megatron.bridge.models.gpt_provider import GPTModelProvider
+from megatron.bridge.models.gpt_provider import GPTModelProvider, local_layer_spec
 from megatron.bridge.peft.canonical_lora import CanonicalLoRA, LoRALinearSplitFC1UpGate, LoRALinearSplitQKV, ModuleDict
 from megatron.bridge.peft.lora_layers import LoRALinear
 from megatron.bridge.peft.utils import AdapterAttributes, GroupedExpertLinearAdapter
@@ -577,6 +579,43 @@ class TestCanonicalLoRA:
         assert adapted.adapter.linear_in.weight.shape == torch.Size([2, 32, 2048])
         assert adapted.adapter.linear_out.weight.shape == torch.Size([2, 512, 32])
 
+    def test_canonical_lora_grouped_expert_per_expert_adapter_init_scale(self):
+        """Per-expert adapters must be initialised like a (dim, in_features) matrix, not like the stacked 3-D tensor.
+
+        The weights are stored as (num_local_experts, dim, in_features); a fan-dependent init evaluated on that
+        tensor would use fan_in = dim * in_features and fan_out = num_local_experts * in_features, shrinking every
+        expert's linear_in by ~sqrt((dim + num_local_experts) * in_features / (in_features + dim)).
+        """
+        model = GroupedExpertMegatronStyleModel()
+        lora = CanonicalLoRA(target_modules=["linear_fc2"], share_expert_adapters=False, lora_A_init_method="xavier")
+
+        def mock_get_attrs(module, is_expert=False):
+            return AdapterAttributes(
+                input_is_parallel=True,
+                in_features=module.in_features,
+                out_features=module.out_features,
+                disable_tensor_parallel_comm=False,
+                disable_sequence_parallel_comm=True,
+                base_linear_is_parallel=True,
+            )
+
+        with patch(
+            "megatron.bridge.peft.canonical_lora.get_adapter_attributes_from_linear",
+            side_effect=mock_get_attrs,
+        ):
+            transformed_model = lora(model, training=True)
+
+        adapter = transformed_model.language_model.decoder.layers[0].mlp.experts.linear_fc2.adapter
+        assert isinstance(adapter, GroupedExpertLinearAdapter)
+        num_local_experts, dim, in_features = adapter.linear_in.weight.shape
+        expected_std = math.sqrt(2.0 / (in_features + dim))  # xavier-normal of one (dim, in_features) matrix
+        stacked_std = math.sqrt(2.0 / (dim * in_features + num_local_experts * in_features))  # the 3-D-tensor fans
+        assert stacked_std < 0.3 * expected_std  # the two scales are far apart for these shapes
+        for expert in range(num_local_experts):
+            std = adapter.linear_in.weight[expert].float().std().item()
+            assert abs(std - expected_std) < 0.05 * expected_std, (expert, std, expected_std, stacked_std)
+        assert torch.count_nonzero(adapter.linear_out.weight) == 0
+
     def test_canonical_lora_wildcard_matching(self):
         """Test CanonicalLoRA transformation with wildcard patterns."""
         model = NestedModel()
@@ -895,6 +934,54 @@ class TestCanonicalLoRAMegatronLayers:
 class TestCanonicalLoRAHelperClasses:
     """Test helper classes for CanonicalLoRA."""
 
+    def test_partial_canonical_qkv_forward_and_sharded_state(self):
+        """A selected Q adapter should leave omitted K/V slices unchanged and unsaved."""
+
+        class ShardedLinear(nn.Linear):
+            def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+                return {f"{prefix}weight": self.weight}
+
+        base_layer = nn.Linear(4, 8, bias=False)
+        nn.init.zeros_(base_layer.weight)
+        base_layer.config = SimpleNamespace(kv_channels=2, num_attention_heads=2, num_query_groups=1)
+        adapter_q = ShardedLinear(4, 4, bias=False)
+        nn.init.eye_(adapter_q.weight)
+        wrapper = LoRALinearSplitQKV(
+            base_layer,
+            ModuleDict({"adapter_q": adapter_q, "adapter_k": None, "adapter_v": None}),
+        )
+
+        x = torch.arange(4, dtype=torch.float32).reshape(1, 1, 4)
+        output, bias = wrapper(x)
+
+        assert bias is None
+        torch.testing.assert_close(
+            output,
+            torch.cat([x, torch.zeros(1, 1, 4)], dim=-1),
+        )
+        assert set(wrapper.adapter.sharded_state_dict(prefix="adapter.")) == {"adapter.adapter_q.weight"}
+
+    def test_partial_canonical_fc1_forward(self):
+        """A selected up adapter should leave the omitted gate slice unchanged."""
+
+        base_layer = nn.Linear(4, 8, bias=False)
+        nn.init.zeros_(base_layer.weight)
+        adapter_up = nn.Linear(4, 4, bias=False)
+        nn.init.eye_(adapter_up.weight)
+        wrapper = LoRALinearSplitFC1UpGate(
+            base_layer,
+            ModuleDict({"adapter_up": adapter_up, "adapter_gate": None}),
+        )
+
+        x = torch.arange(4, dtype=torch.float32).reshape(1, 1, 4)
+        output, bias = wrapper(x)
+
+        assert bias is None
+        torch.testing.assert_close(
+            output,
+            torch.cat([torch.zeros(1, 1, 4), x], dim=-1),
+        )
+
     def test_module_dict_sharded_state_dict(self):
         """Test ModuleDict's sharded_state_dict method."""
 
@@ -1133,6 +1220,10 @@ class TestCanonicalLoRAMegatronIntegration:
             num_attention_heads=2,
             vocab_size=1000,
             ffn_hidden_size=256,
+            # Construction and adapter ownership do not need a CUDA attention kernel.
+            attention_backend=AttnBackend.local,
+            transformer_layer_spec=local_layer_spec,
+            use_cpu_initialization=not torch.cuda.is_available(),
         )
 
         from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1192,6 +1283,10 @@ class TestCanonicalLoRAMegatronIntegration:
         efficiency_ratio = trainable_params / total_params
         assert efficiency_ratio < 0.3, f"CanonicalLoRA should be parameter efficient, got ratio: {efficiency_ratio}"
 
+    # Core's DotProductAttention uses a CUDA GlobalMemoryBuffer and CUDA RNG
+    # even with the local layer spec. Keep the real forward path on GPU instead
+    # of replacing those production operations in a CPU construction check.
+    @pytest.mark.run_only_on("gpu")
     @pytest.mark.pleasefixme  # This test is too slow for unit tests (>Xs)
     def test_canonical_lora_forward_pass_with_megatron_model(self):
         """Test forward pass through CanonicalLoRA-adapted Megatron model using pre-wrap hooks."""
@@ -1203,6 +1298,8 @@ class TestCanonicalLoRAMegatronIntegration:
             num_attention_heads=2,
             vocab_size=128,
             ffn_hidden_size=128,
+            attention_backend=AttnBackend.local,
+            transformer_layer_spec=local_layer_spec,
         )
 
         # Create CanonicalLoRA and register hook

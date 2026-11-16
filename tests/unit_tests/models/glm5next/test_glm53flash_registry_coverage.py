@@ -11,33 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Module-tree coverage guard for the GLM-5.3-Flash Megatron->HF mapping registry.
+"""Mapping coverage for all 3909 parameter names captured from the failing GLM-5.3-Flash run.
 
-``GLM53FlashBridge.mapping_registry()`` keys every per-layer entry on the module tree
-Megatron-Core builds for the language model.  That tree is *conditional*:
-
-* with ``config.enable_hyper_connections`` set, ``HybridStack`` wraps each physical layer
-  in ``HyperConnectionHybridLayer`` (``megatron/core/models/hybrid/hybrid_block.py:873``),
-  which nests the layer under ``inner_layer.`` (``hybrid_block.py:151``), and the MTP
-  builds split ``e_proj``/``h_proj`` (``megatron/core/transformer/multi_token_prediction.py:1533``);
-* without it, the physical layers sit directly under ``decoder.layers.<N>`` and the MTP
-  builds a fused ``eh_proj``.
-
-Every registry path in this bridge is written for the *wrapped* tree, and
-``provider_bridge`` is responsible for turning that tree on.  When it assigned a field
-name the runtime Megatron-Core does not declare (``enable_mhc_connections``; the field is
-``enable_hyper_connections``), the assignment silently no-op'd on the provider dataclass
-and HF->Megatron conversion failed with 3909 unmapped parameters::
-
-    ValueError: No mapping found for the following Megatron parameter(s):
-      language_model.decoder.layers.0.input_layernorm.weight
-      ...
-
-``_OBSERVED_UNMAPPED_PARAMETERS`` below is that run's complete parameter list, verbatim
-(3909 entries, captured from ``rank0.log``).  The test rebuilds the tree MCore actually
-builds for the provider's configuration and requires the registry to cover all of it, so
-it fails both when a family loses its mapping and when the module tree regresses to the
-unwrapped shape.
+The fixture below remains the complete observed unwrapped module tree. The configured
+Core902 mHC tree inserts ``inner_layer`` around each physical layer and splits MTP's
+``eh_proj``. Both builder and legacy provider conversion must set Core's real
+``enable_mhc_connections`` / ``mhc_num_residual_streams`` fields so every resulting
+parameter resolves to its Hugging Face mapping, including optional MTP weights.
 """
 
 from __future__ import annotations
@@ -82,6 +62,7 @@ _TEXT_CONFIG = {
     "routed_scaling_factor": 2.5,
     "q_lora_rank": 1536,
     "kv_lora_rank": 512,
+    "qk_head_dim": 256,
     "qk_nope_head_dim": 256,
     "qk_rope_head_dim": 0,
     "v_head_dim": 256,
@@ -306,12 +287,12 @@ def test_provider_bridge_enables_the_hyper_connection_module_tree():
     the ``TransformerConfig``, which is how the wrapped tree went missing.
     """
     provider = _provider()
-    assert "enable_hyper_connections" in GLM53FlashModelProvider.__dataclass_fields__
-    assert provider.enable_hyper_connections is True, (
-        "provider_bridge left enable_hyper_connections unset; the HyperConnectionHybridLayer "
+    assert "enable_mhc_connections" in GLM53FlashModelProvider.__dataclass_fields__
+    assert provider.enable_mhc_connections is True, (
+        "provider_bridge left enable_mhc_connections unset; the HyperConnectionHybridLayer "
         "wrapper (and therefore every inner_layer. registry path) will not exist"
     )
-    assert provider.num_residual_streams == _TEXT_CONFIG["hc_mult"]
+    assert provider.mhc_num_residual_streams == _TEXT_CONFIG["hc_mult"]
 
 
 def test_registry_covers_every_parameter_of_every_layer_in_the_configured_module_tree():
@@ -322,13 +303,13 @@ def test_registry_covers_every_parameter_of_every_layer_in_the_configured_module
     registry = bridge.mapping_registry()
 
     assert len(_OBSERVED_UNMAPPED_PARAMETERS) == 3909
-    names = _module_tree_names(_OBSERVED_UNMAPPED_PARAMETERS, hyper_connections=provider.enable_hyper_connections)
+    names = _module_tree_names(_OBSERVED_UNMAPPED_PARAMETERS, hyper_connections=provider.enable_mhc_connections)
     unmapped = [
         name for name in names if registry.megatron_to_hf_lookup(bridge._get_lora_unwrapped_name(name)) is None
     ]
     assert not unmapped, (
         f"{len(unmapped)} of {len(names)} Megatron parameters have no HF mapping after the "
-        f"model was configured with enable_hyper_connections={provider.enable_hyper_connections}:\n  "
+        f"model was configured with enable_mhc_connections={provider.enable_mhc_connections}:\n  "
         + "\n  ".join(unmapped[:20])
     )
 
