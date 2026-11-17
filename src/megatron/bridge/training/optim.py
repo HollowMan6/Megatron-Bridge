@@ -15,6 +15,7 @@
 import logging
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from fnmatch import fnmatch
 from types import MethodType
 from typing import Optional, Union, cast
 
@@ -25,8 +26,7 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     get_mup_config_overrides,
 )
-from megatron.core.optimizer.muon import get_megatron_muon_optimizer
-from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler, combine_param_group_overrides
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_model_config
@@ -36,6 +36,7 @@ from megatron.bridge.training.config import (
     OptimizerConfigOverrideProviderContext,
     SchedulerConfig,
 )
+from megatron.bridge.training.utils.optimizer_utils import normalize_optimizer_config
 
 
 G_LOGGER = logging.getLogger(__name__)
@@ -109,6 +110,7 @@ def hybrid_optimizer_state_loading(optimizer: MegatronOptimizer | None) -> Itera
             else:
                 setattr(distributed, "_set_main_param_and_optimizer_states", previous)
 
+
 def setup_optimizer(
     optimizer_config: OptimizerConfig,
     scheduler_config: SchedulerConfig,
@@ -129,6 +131,11 @@ def setup_optimizer(
     Returns:
         tuple containing the optimizer and scheduler
     """
+    if not hasattr(optimizer_config, "provide"):
+        # setup_optimizer is also used by callers that construct Core's config
+        # directly, without ConfigContainer validation.
+        normalize_optimizer_config(optimizer_config)
+
     if optimizer_config_override_provider is None:
         optimizer_config_override_provider = OptimizerConfigOverrideProvider()
 
@@ -153,6 +160,29 @@ def setup_optimizer(
                 f"applied {len(mup_overrides)} optimizer param-group override(s)."
             )
 
+    # Check name-based LoRA+ overrides without depending on rank-local parameters.
+    # MCore scales peak/minimum rates but uses one shared initial rate during warmup.
+    if config_overrides and scheduler_config.lr_warmup_init != 0:
+
+        def effective_lr_bounds(param_name: str) -> tuple[float | None, float | None]:
+            override = combine_param_group_overrides(
+                [
+                    value
+                    for key, value in config_overrides.items()
+                    if any(
+                        fnmatch(param_name, name) for name in ((key.name,) if isinstance(key.name, str) else key.name)
+                    )
+                ]
+            )
+            return override.get("max_lr", optimizer_config.lr), override.get("min_lr", optimizer_config.min_lr)
+
+        if effective_lr_bounds("adapter.linear_in.weight") != effective_lr_bounds("adapter.linear_out.weight"):
+            raise ValueError(
+                "LoRA+ with different A/B learning rates requires SchedulerConfig.lr_warmup_init=0. "
+                "A nonzero warmup initial learning rate breaks the LoRA+ ratio. "
+                "Set lr_warmup_init=0 or lora_plus_ratio=1."
+            )
+
     if hasattr(optimizer_config, "provide"):
         optimizer = optimizer_config.provide(
             model_chunks=model,
@@ -160,21 +190,12 @@ def setup_optimizer(
             use_gloo_process_groups=use_gloo_process_groups,
             pg_collection=pg_collection,
         )
-    elif "muon" not in optimizer_config.optimizer and "soap" not in optimizer_config.optimizer:
+    else:
         optimizer = get_megatron_optimizer(
             config=optimizer_config,
             model_chunks=model,
             config_overrides=config_overrides,
             use_gloo_process_groups=use_gloo_process_groups,
-            pg_collection=pg_collection,
-        )
-    else:
-        optimizer = get_megatron_muon_optimizer(
-            config=optimizer_config,
-            model_chunks=model,
-            config_overrides=config_overrides,
-            use_gloo_process_groups=use_gloo_process_groups,
-            layer_wise_distributed_optimizer="dist" in optimizer_config.optimizer,
             pg_collection=pg_collection,
         )
 
@@ -410,7 +431,15 @@ def memory_efficient_fp32_optimizer_state_loading(
 
 
 def sync_hybrid_device_optimizer_fp32_master_copies(optimizer: MegatronOptimizer | None) -> bool:
-    """Refresh ``HybridDeviceOptimizer`` FP32 master copies from BF16 model parameters.
+    """Synchronize ``HybridDeviceOptimizer`` working copies after checkpoint loading.
+
+    A freshly constructed optimizer has no state when only model weights were
+    loaded. Refresh its FP32 working copies from those model weights. When
+    optimizer state was restored, preserve its full-precision masters and
+    synchronize the CPU/GPU sub-optimizers with that state instead. Rebuilding
+    restored masters from BF16 weights discards their low bits and changes the
+    next update. The pinned Core ``dp_reshardable`` loader also replaces state
+    tensors without refreshing HybridDeviceOptimizer's working copies.
 
     Workaround for an upstream Megatron-Core gap: when a checkpoint is loaded
     into the BF16 model parameters, ``reload_model_params()`` only refreshes
@@ -425,9 +454,9 @@ def sync_hybrid_device_optimizer_fp32_master_copies(optimizer: MegatronOptimizer
     random init.  Training loss looks plausible at step 1 and collapses at
     step 2 because the model is no longer the one loaded from the checkpoint.
 
-    Mirrors the workaround in NVIDIA-NeMo/RL PR #2372.  Once mcore's
-    ``reload_model_params()`` walks all three FP32 levels, this helper can be
-    removed from both Bridge and RL.
+    The model-only branch mirrors NVIDIA-NeMo/RL PR #2372. This helper can
+    be removed once Core handles model-only master refresh, full-state
+    rebinding, and the restored sub-optimizer step counters.
 
     Args:
         optimizer: The Megatron optimizer returned by :func:`setup_optimizer`.
@@ -447,10 +476,41 @@ def sync_hybrid_device_optimizer_fp32_master_copies(optimizer: MegatronOptimizer
         return False
 
     def _sync_one(distrib_opt: MegatronOptimizer) -> bool:
-        """Sync the three FP32 master levels for one DistributedOptimizer wrapping an HDO."""
+        """Sync HDO leaves without accessing a chained optimizer's single-leaf property."""
+        sub_optimizers = getattr(distrib_opt, "chained_optimizers", None)
+        if isinstance(sub_optimizers, (list, tuple)):
+            synced = False
+            for sub_opt in sub_optimizers:
+                synced |= _sync_one(sub_opt)
+            return synced
+
         inner = getattr(distrib_opt, "optimizer", None)
         if not isinstance(inner, HybridDeviceOptimizer):
             return False
+
+        if getattr(inner, "state", None):
+            # The dp_reshardable loader restores each per-parameter "step"
+            # from a LocalNonpersistentObject in its loading scaffold. For
+            # CPU Adam this overwrites the checkpoint counter with the dummy
+            # initialization step. The saved group counter is authoritative.
+            for group in inner.param_groups:
+                if "step" not in group:
+                    continue
+                for param in group["params"]:
+                    step = inner.state.get(param, {}).get("step")
+                    if isinstance(step, torch.Tensor):
+                        step.fill_(group["step"])
+            # Full-state resume, including iteration-zero checkpoints. This
+            # binds loaded moments to the sub-optimizers and copies the saved
+            # FP32 masters into the parameters their next step will update.
+            inner._sync_hdo_state_to_sub_optimizers()
+            # Core stores Adam's step on the outer groups for checkpointing.
+            # Seed the GPU groups once, then let each sub-optimizer advance:
+            # HDO otherwise reapplies the saved step before every update.
+            inner._sync_hdo_param_groups_to_sub_optimizers()
+            for group in inner.param_groups:
+                group.pop("step", None)
+            return True
 
         # Level 1: per-DP-rank FP32 GPU shards (Adam master parameters).
         for model_group, shard_main_group in zip(
@@ -476,17 +536,12 @@ def sync_hybrid_device_optimizer_fp32_master_copies(optimizer: MegatronOptimizer
 
         return True
 
-    synced = False
-    if hasattr(optimizer, "chained_optimizers"):
-        for sub_opt in optimizer.chained_optimizers:
-            synced |= _sync_one(sub_opt)
-    else:
-        synced = _sync_one(optimizer)
+    synced = _sync_one(optimizer)
 
     if synced:
         G_LOGGER.info(
-            "Synced HybridDeviceOptimizer FP32 master copies from BF16 model parameters "
-            "after checkpoint load (workaround for upstream mcore reload_model_params() gap)."
+            "Synced HybridDeviceOptimizer working copies after checkpoint load, "
+            "preserving restored optimizer state when present."
         )
     return synced
 

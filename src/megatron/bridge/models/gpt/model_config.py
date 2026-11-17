@@ -15,16 +15,19 @@
 """Serializable Bridge extension of Megatron-LM's GPT model config."""
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
-from megatron.bridge.models.common.base import ModelConfig
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+
+from megatron.bridge.models.common.base import ModelConfig, ModelConfigOverrideMixin
 from megatron.bridge.models.gpt.gpt_builder import GPTModelConfig
+from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.bridge.utils.activation_map import callable_to_str, str_to_callable
 from megatron.bridge.utils.instantiate_utils import _resolve_target
 
 
 @dataclass(kw_only=True)
-class BridgeGPTModelConfig(GPTModelConfig):
+class BridgeGPTModelConfig(ModelConfigOverrideMixin, GPTModelConfig, ModelConfig):
     """GPT model config with strict overrides and callable serialization.
 
     Outer GPT build fields and nested transformer fields keep one declared
@@ -35,31 +38,14 @@ class BridgeGPTModelConfig(GPTModelConfig):
     dedicated field here. It is recorded in the inherited serializable
     ``extra_checkpoint_metadata`` mapping so it round-trips through
     ``run_config.yaml`` without adding model-specific config fields.
+    ``hf_model_text_only`` records that the source checkpoint was projected to
+    its language model, so a restored config reopens the same projection.
     """
 
-    def __setattr__(self, name: str, value: Any, /) -> None:
-        """Assign a declared outer or nested field and reject phantom fields."""
-        try:
-            transformer = object.__getattribute__(self, "transformer")
-        except AttributeError:
-            object.__setattr__(self, name, value)
-            return
+    transformer_config_class: ClassVar[type[TransformerConfig]] = TransformerConfig
 
-        model_fields = getattr(type(self), "__dataclass_fields__", {})
-        transformer_fields = getattr(type(transformer), "__dataclass_fields__", {})
-
-        if name == "transformer":
-            object.__setattr__(self, name, value)
-        elif name in model_fields:
-            object.__setattr__(self, name, value)
-        elif name in transformer_fields:
-            setattr(transformer, name, value)
-        elif name == "builder" or name.startswith("_"):
-            object.__setattr__(self, name, value)
-        else:
-            raise AttributeError(
-                f"Neither {type(self).__name__} nor {type(transformer).__name__} declares a field named {name!r}."
-            )
+    hf_model_text_only: bool = False
+    """Whether the source HF checkpoint was projected to its language model."""
 
     def get_builder_cls(self) -> type:
         """Resolve the configured builder through Bridge's target allowlist."""
@@ -69,7 +55,7 @@ class BridgeGPTModelConfig(GPTModelConfig):
         return builder_cls
 
     def as_dict(self) -> dict[str, Any]:
-        """Serialize the config with a symbolic activation function."""
+        """Serialize the config with a symbolic activation function and a restorable pipeline layout."""
         data = super().as_dict()
         transformer_data = data.get("transformer")
         if not isinstance(transformer_data, dict):
@@ -85,6 +71,12 @@ class BridgeGPTModelConfig(GPTModelConfig):
             raise ValueError(f"Cannot serialize unregistered activation callable: {activation_func!r}.")
 
         transformer_data["activation_func"] = activation_name
+
+        # finalize() parses the layout into an object that a saved run config cannot restore.
+        # Persist the layout as given, as the provider checkpoint path does.
+        layout = transformer_data.get("pipeline_model_parallel_layout")
+        if isinstance(layout, PipelineParallelLayerLayout):
+            transformer_data["pipeline_model_parallel_layout"] = layout.input_data
         return data
 
     @classmethod

@@ -23,6 +23,11 @@ from typing import Any, Optional
 import torch
 import yaml
 from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.training.utils.checkpoint_utils import (
+    CONFIG_FILE,
+    get_checkpoint_run_config_filename,
+    join_paths,
+)
 
 from megatron.bridge.training.state import TrainState
 from megatron.bridge.training.utils.config_utils import apply_run_config_backward_compat
@@ -34,9 +39,16 @@ from megatron.bridge.utils.instantiate_utils import (
 )
 
 
+__all__ = [
+    "CONFIG_FILE",
+    "get_checkpoint_run_config_filename",
+    "join_paths",
+    "read_run_config",
+]
+
+
 TRAIN_STATE_FILE = "train_state.pt"
 TRACKER_PREFIX = "latest"
-CONFIG_FILE = "run_config.yaml"
 
 logger = logging.getLogger(__name__)
 _RUNTIME_ONLY_TARGETS = frozenset({"megatron.core.timers.Timers"})
@@ -80,24 +92,6 @@ def file_exists(path: str) -> bool:
         msc = MultiStorageClientFeature.import_package()
         return msc.os.path.exists(path)
     return os.path.exists(path)
-
-
-def join_paths(*paths: str) -> str:
-    """Join paths, using MultiStorageClient when needed"""
-    if not paths:
-        raise ValueError("Empty paths")
-
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        path_cls = msc.Path
-    else:
-        path_cls = Path
-
-    path = path_cls(paths[0])
-    for part in paths[1:]:
-        path = path / part
-
-    return str(path)
 
 
 def ensure_directory_exists(filename: str, check_parent: bool = True) -> None:
@@ -154,18 +148,6 @@ def get_checkpoint_train_state_filename(checkpoints_path: str, prefix: Optional[
         return join_paths(checkpoints_path, TRAIN_STATE_FILE)
     else:
         return join_paths(checkpoints_path, f"{prefix}_{TRAIN_STATE_FILE}")
-
-
-def get_checkpoint_run_config_filename(checkpoints_path: str) -> str:
-    """Get the filename for the run configuration file within a checkpoint directory.
-
-    Args:
-        checkpoints_path: Base directory where checkpoints are stored.
-
-    Returns:
-        The full path to the run configuration file (e.g., run_config.yaml).
-    """
-    return join_paths(checkpoints_path, CONFIG_FILE)
 
 
 def get_checkpoint_tracker_filename(checkpoints_path: str) -> str:
@@ -319,6 +301,28 @@ def checkpoint_exists(checkpoints_path: Optional[str]) -> bool:
         return os.path.isfile(path)
 
 
+def get_hf_source_from_model_config(model_config: Any) -> tuple[str | None, str | None]:
+    """Return the Hugging Face source id and revision recorded on a model config.
+
+    Builder-backed configs record them in ``extra_checkpoint_metadata``; legacy
+    providers in flat ``hf_model_id`` / ``hf_model_revision`` fields. The
+    revision is read from the same record as the id.
+
+    Args:
+        model_config: Builder-backed model config or model provider.
+
+    Returns:
+        ``(hf_model_id, hf_model_revision)``, each ``None`` when not recorded.
+    """
+    metadata = getattr(model_config, "extra_checkpoint_metadata", None)
+    if isinstance(metadata, dict) and metadata.get("hf_model_id"):
+        return metadata["hf_model_id"], metadata.get("hf_model_revision")
+    hf_model_id = getattr(model_config, "hf_model_id", None)
+    if hf_model_id:
+        return hf_model_id, getattr(model_config, "hf_model_revision", None)
+    return None, None
+
+
 def get_hf_model_id_from_checkpoint(path: str | os.PathLike[str]) -> str | None:
     """
     Infer the HuggingFace model identifier recorded in a Megatron Bridge checkpoint.
@@ -413,6 +417,37 @@ def get_hf_model_id_from_checkpoint(path: str | os.PathLike[str]) -> str | None:
         return None
 
     return str(hf_model_id)
+
+
+def _sanitize_run_config_object(obj: Any) -> Any:
+    """Remove runtime-only objects from run config dictionaries.
+
+    Timers and other runtime constructs are serialized with `_target_` entries
+    that cannot be recreated without additional context (e.g., constructor
+    arguments provided at runtime). These objects are not required when loading
+    a checkpoint configuration, so we replace them with ``None`` to avoid
+    instantiation errors when the config is processed later.
+    """
+
+    if isinstance(obj, dict):
+        target = obj.get("_target_")
+        if isinstance(target, str) and target in _RUNTIME_ONLY_TARGETS:
+            return None
+        if (
+            target == _RECIPE_CONFIG_TARGET
+            and obj.get("_call_", True) is True
+            and set(obj).issubset({"_target_", "_call_"})
+        ):
+            logger.warning(
+                "Ignoring a legacy quantization recipe whose state was not preserved in run_config.yaml. "
+                "The checkpoint can still be loaded, but the original per-module quantization settings "
+                "must be supplied separately if they are needed."
+            )
+            return None
+        return {key: _sanitize_run_config_object(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_run_config_object(item) for item in obj]
+    return obj
 
 
 @lru_cache()
@@ -525,34 +560,3 @@ def read_train_state(train_state_filename: str) -> TrainState:
         return ts
     except Exception as e:
         raise RuntimeError(f"Unable to load train state file {train_state_filename}: {e}") from e
-
-
-def _sanitize_run_config_object(obj: Any) -> Any:
-    """Remove runtime-only objects from run config dictionaries.
-
-    Timers and other runtime constructs are serialized with `_target_` entries
-    that cannot be recreated without additional context (e.g., constructor
-    arguments provided at runtime). These objects are not required when loading
-    a checkpoint configuration, so we replace them with ``None`` to avoid
-    instantiation errors when the config is processed later.
-    """
-
-    if isinstance(obj, dict):
-        target = obj.get("_target_")
-        if isinstance(target, str) and target in _RUNTIME_ONLY_TARGETS:
-            return None
-        if (
-            target == _RECIPE_CONFIG_TARGET
-            and obj.get("_call_", True) is True
-            and set(obj).issubset({"_target_", "_call_"})
-        ):
-            logger.warning(
-                "Ignoring a legacy quantization recipe whose state was not preserved in run_config.yaml. "
-                "The checkpoint can still be loaded, but the original per-module quantization settings "
-                "must be supplied separately if they are needed."
-            )
-            return None
-        return {key: _sanitize_run_config_object(value) for key, value in obj.items()}
-    if isinstance(obj, list):
-        return [_sanitize_run_config_object(item) for item in obj]
-    return obj

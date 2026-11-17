@@ -21,15 +21,16 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 
-from megatron.bridge.models.gpt_provider import GPTModelProvider
+from megatron.bridge.models.gpt_provider import GPTModelProvider, local_layer_spec
 from megatron.bridge.peft import canonical_lora as canonical_lora_module
 from megatron.bridge.peft import lora as lora_module
 from megatron.bridge.peft import utils as peft_utils
 from megatron.bridge.peft.canonical_lora import CanonicalLoRA
 from megatron.bridge.peft.lora import LoRA, VLMLoRA
-from megatron.bridge.peft.lora_layers import LinearAdapter, LoRALinear
+from megatron.bridge.peft.lora_layers import LinearAdapter, LoRALinear, TEFusedLoRALinear, TEFusedLoRAMergeLinear
 from megatron.bridge.peft.lora_merge import LoRAMerge
 from megatron.bridge.peft.utils import (
     AdapterAttributes,
@@ -226,6 +227,7 @@ class TestLoRA:
         assert lora.lora_A_init_method == "xavier"
         assert lora.lora_B_init_method == "zero"
         assert lora.share_expert_adapters is True
+        assert lora.use_transformer_engine_op_fuser is False
 
         # Test custom initialization
         custom_lora = LoRA(
@@ -237,6 +239,7 @@ class TestLoRA:
             sequence_parallel_input_regather=True,
             lora_A_init_method="uniform",
             share_expert_adapters=False,
+            use_transformer_engine_op_fuser=True,
         )
         assert custom_lora.target_modules == ["linear_qkv"]
         assert custom_lora.dim == 16
@@ -246,6 +249,50 @@ class TestLoRA:
         assert custom_lora.sequence_parallel_input_regather is True
         assert custom_lora.lora_A_init_method == "uniform"
         assert custom_lora.share_expert_adapters is False
+        assert custom_lora.use_transformer_engine_op_fuser is True
+
+    def test_lora_op_fuser_dispatches_without_global_transformer_fusion(self):
+        model = MockMegatronLinear(8, 8)
+        lora = LoRA(target_modules=["linear"], use_transformer_engine_op_fuser=True)
+        attrs = AdapterAttributes(
+            input_is_parallel=False,
+            in_features=8,
+            out_features=8,
+            disable_tensor_parallel_comm=False,
+            disable_sequence_parallel_comm=True,
+            base_linear_is_parallel=True,
+        )
+
+        with (
+            patch.object(parallel_state, "get_tensor_model_parallel_world_size", return_value=1),
+            patch("megatron.bridge.peft.lora.get_adapter_attributes_from_linear", return_value=attrs),
+            patch("megatron.bridge.peft.lora.ParallelLinearAdapter", return_value=nn.Identity()),
+        ):
+            transformed = lora.transform(model, name="linear")
+
+        assert isinstance(transformed, TEFusedLoRALinear)
+
+    def test_lora_op_fuser_preserves_expert_base_linear(self):
+        model = MockMegatronLinear(8, 8)
+        lora = LoRA(target_modules=["linear_fc2"], use_transformer_engine_op_fuser=True)
+        attrs = AdapterAttributes(
+            input_is_parallel=True,
+            in_features=8,
+            out_features=8,
+            disable_tensor_parallel_comm=False,
+            disable_sequence_parallel_comm=True,
+            base_linear_is_parallel=True,
+        )
+
+        with (
+            patch.object(parallel_state, "get_tensor_model_parallel_world_size", return_value=1),
+            patch("megatron.bridge.peft.lora.is_expert_linear", return_value=True),
+            patch("megatron.bridge.peft.lora.get_adapter_attributes_from_linear", return_value=attrs),
+            patch("megatron.bridge.peft.lora.ParallelLinearAdapter", return_value=nn.Identity()),
+        ):
+            transformed = lora.transform(model, name="linear_fc2")
+
+        assert isinstance(transformed, TEFusedLoRAMergeLinear)
 
     def test_lora_transform_simple_model(self):
         """Test LoRA transformation on a simple model."""
@@ -493,6 +540,26 @@ class TestLoRA:
             assert proj_out.shape == (batch_size, seq_len, 512)
             assert fc1_out.shape == (batch_size, seq_len, 2048)
             assert fc2_out.shape == (batch_size, seq_len, 512)
+
+    def test_lora_forward_casts_mixed_dtype_adapter_branch(self):
+        """LoRA may use lower-precision weights than an FP32 base projection."""
+        base = nn.Linear(4, 3, bias=False, dtype=torch.float32)
+        adapter = LinearAdapter(base, dim=2, alpha=2, lora_dtype=torch.bfloat16)
+        with torch.no_grad():
+            adapter.linear_out.weight.fill_(0.25)
+        wrapped = LoRALinear(base, adapter)
+        x = torch.randn(2, 4, dtype=torch.float32, requires_grad=True)
+
+        output = wrapped(x)
+        expected = base(x) + adapter(x.to(torch.bfloat16)).to(torch.float32)
+
+        assert output.dtype == torch.float32
+        torch.testing.assert_close(output, expected)
+        output.sum().backward()
+        assert x.grad is not None
+        assert x.grad.dtype == torch.float32
+        assert adapter.linear_in.weight.grad is not None
+        assert adapter.linear_in.weight.grad.dtype == torch.bfloat16
 
     def test_lora_training_vs_inference_mode(self):
         """Test LoRA behavior in training vs inference mode."""
@@ -933,18 +1000,16 @@ class TestLoRAMerge:
 
         # Mock the distributed environment for TP=2
         tp_size = 2
+        tp_group = MockProcessGroup(tp_size)
+
+        # Simulate the autograd-aware gather: each rank has identical shards for this test
+        def mock_all_gather(tensor, group=None):
+            return tuple(tensor for _ in range(tp_size))
+
         with (
-            patch("megatron.bridge.peft.lora_merge.dist") as mock_dist,
+            patch("megatron.bridge.peft.lora_merge.all_gather", side_effect=mock_all_gather) as mock_gather,
             patch("megatron.bridge.peft.lora_merge.get_pg_size", return_value=tp_size),
         ):
-            # Mock all_gather to simulate gathering from 2 ranks
-            def mock_all_gather(tensor_list, tensor, group=None):
-                # Simulate gathering: each rank has identical shards for this test
-                for i in range(tp_size):
-                    tensor_list[i].copy_(tensor)
-
-            mock_dist.all_gather.side_effect = mock_all_gather
-
             # Apply merge
             merge = LoRAMerge()
             merged_weight = merge.merge(
@@ -953,8 +1018,10 @@ class TestLoRAMerge:
                 adapter.linear_in.weight,
                 adapter.alpha,
                 adapter.dim,
-                tp_group=MockProcessGroup(tp_size),
+                tp_group=tp_group,
             )
+
+        mock_gather.assert_called_once_with(adapter.linear_in.weight, group=tp_group)
 
         # Verify the merge used gathered weights
         # Reconstruct what the full linear_in would be after gathering
@@ -992,18 +1059,16 @@ class TestLoRAMerge:
 
         # Mock the distributed environment for TP=2
         tp_size = 2
+        tp_group = MockProcessGroup(tp_size)
+
+        # Simulate the autograd-aware gather: each rank has identical shards for this test
+        def mock_all_gather(tensor, group=None):
+            return tuple(tensor for _ in range(tp_size))
+
         with (
-            patch("megatron.bridge.peft.lora_merge.dist") as mock_dist,
+            patch("megatron.bridge.peft.lora_merge.all_gather", side_effect=mock_all_gather) as mock_gather,
             patch("megatron.bridge.peft.lora_merge.get_pg_size", return_value=tp_size),
         ):
-            # Mock all_gather to simulate gathering from 2 ranks
-            def mock_all_gather(tensor_list, tensor, group=None):
-                # Simulate gathering: each rank has identical shards for this test
-                for i in range(tp_size):
-                    tensor_list[i].copy_(tensor)
-
-            mock_dist.all_gather.side_effect = mock_all_gather
-
             # Apply merge
             merge = LoRAMerge()
             merged_weight = merge.merge(
@@ -1012,8 +1077,10 @@ class TestLoRAMerge:
                 adapter.linear_in.weight,
                 adapter.alpha,
                 adapter.dim,
-                tp_group=MockProcessGroup(tp_size),
+                tp_group=tp_group,
             )
+
+        mock_gather.assert_called_once_with(adapter.linear_out.weight, group=tp_group)
 
         # Verify the merge used gathered weights
         # Reconstruct what the full linear_out would be after gathering
@@ -1236,6 +1303,10 @@ class TestLoRAMegatronIntegration:
             num_attention_heads=2,
             vocab_size=1000,
             ffn_hidden_size=256,
+            # This check exercises LoRA construction, not a fused attention kernel.
+            attention_backend=AttnBackend.local,
+            transformer_layer_spec=local_layer_spec,
+            use_cpu_initialization=not torch.cuda.is_available(),
         )
 
         # Attach real pg_collection from initialized parallel state
@@ -1261,7 +1332,8 @@ class TestLoRAMegatronIntegration:
         assert len(adapted_model) > 0
         assert all(isinstance(chunk, MegatronModule) for chunk in adapted_model)
 
-        adapted_model = [chunk.cuda() for chunk in adapted_model]
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        adapted_model = [chunk.to(device) for chunk in adapted_model]
 
         # Verify that LoRA was applied to target modules
         found_lora_modules = []
@@ -1306,6 +1378,9 @@ class TestLoRAMegatronIntegration:
                 num_attention_heads=2,
                 vocab_size=100,
                 ffn_hidden_size=128,
+                attention_backend=AttnBackend.local,
+                transformer_layer_spec=local_layer_spec,
+                use_cpu_initialization=not torch.cuda.is_available(),
             )
 
             from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1320,7 +1395,8 @@ class TestLoRAMegatronIntegration:
 
             # Get adapted model using hook
             adapted_model = model_provider.provide_distributed_model(ddp_config=None, wrap_with_ddp=False)
-            adapted_model = [chunk.cuda() for chunk in adapted_model]
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            adapted_model = [chunk.to(device) for chunk in adapted_model]
 
             # Count LoRA modules
             lora_count = sum(
@@ -1339,6 +1415,9 @@ class TestLoRAMegatronIntegration:
             num_attention_heads=2,
             vocab_size=100,
             ffn_hidden_size=128,
+            attention_backend=AttnBackend.local,
+            transformer_layer_spec=local_layer_spec,
+            use_cpu_initialization=not torch.cuda.is_available(),
         )
 
         from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1354,7 +1433,8 @@ class TestLoRAMegatronIntegration:
         model_provider.finalize()
         first_transform = model_provider.provide_distributed_model(ddp_config=None, wrap_with_ddp=False)
 
-        first_transform = [chunk.cuda() for chunk in first_transform]
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        first_transform = [chunk.to(device) for chunk in first_transform]
 
         # Store references to the transformed model chunks
         first_chunks = [chunk for chunk in first_transform]

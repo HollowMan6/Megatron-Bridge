@@ -560,7 +560,10 @@ def _run_import(monkeypatch, *, direct_write: bool, capture_unquantized: bool = 
     )
 
     hf_pretrained = SimpleNamespace(state={"hf.w": payload, "hf.w_scale_inv": scale}, model_name_or_path="dummy")
-    model = SimpleNamespace(config=SimpleNamespace(fp8_param=True, fp8_recipe="blockwise"))
+    # Import finalization now refreshes parameter-derived caches by traversing
+    # the real model interface. Keep the fixture a module rather than a config-only shell.
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(fp8_param=True, fp8_recipe="blockwise")
     bridge.load_weights_hf_to_megatron(hf_pretrained, [model])
     return bridge, param, payload, scale
 
@@ -620,7 +623,10 @@ def test_import_loop_requantizes_a_bf16_source_into_the_fp8_param(monkeypatch):
     )
 
     hf_pretrained = SimpleNamespace(state={"hf.w": payload}, model_name_or_path="dummy")
-    model = SimpleNamespace(config=SimpleNamespace(fp8_param=True, fp8_recipe="blockwise"))
+    # Import finalization now refreshes parameter-derived caches by traversing
+    # the real model interface. Keep the fixture a module rather than a config-only shell.
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(fp8_param=True, fp8_recipe="blockwise")
     bridge.load_weights_hf_to_megatron(hf_pretrained, [model])
 
     assert param.last_copy_source is payload

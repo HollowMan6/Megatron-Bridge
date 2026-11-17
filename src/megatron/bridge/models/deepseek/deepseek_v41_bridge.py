@@ -19,10 +19,10 @@ from typing import Any, Dict, Mapping, Optional, Union
 
 import torch
 import torch.distributed
-from transformers import AutoConfig
 import torch.nn as nn
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer.module import MegatronModule
+from transformers import AutoConfig
 
 from megatron.bridge.models.conversion import quantization_utils
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
@@ -40,12 +40,12 @@ from megatron.bridge.models.conversion.param_mapping import (
     MegatronParamMapping,
     ReplicatedMapping,
 )
-from megatron.bridge.models.deepseek.deepseek_v41_provider import DeepSeekV41ModelProvider
 from megatron.bridge.models.deepseek.configuration_deepseek_v41 import (
     DeepSeekV41Config,
     DeepSeekV41TextConfig,
     DeepSeekV41VisionConfig,
 )
+from megatron.bridge.models.deepseek.deepseek_v41_provider import DeepSeekV41ModelProvider
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.hf_pretrained.state import (
     SafeTensorsStateSource,

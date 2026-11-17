@@ -25,7 +25,7 @@ from megatron.training.config.utils import (
     _resolve_target_class,  # noqa: F401
 )
 from megatron.training.config.utils import (
-    sanitize_dataclass_config as _sanitize_dataclass_config,
+    sanitize_dataclass_config as _sanitize_dataclass_config,  # noqa: F401
 )
 from transformers import PreTrainedConfig
 
@@ -66,6 +66,7 @@ def _materialize_gtp_weight_shards(value: Any, _memo: dict[int, Any] | None = No
             result[shard_name] = parallel_size * remat_size
     return result
 
+
 class _ConfigContainerBase(_MCoreConfigContainerBase):
     """Bridge config container that lets composite HF configs construct their children.
 
@@ -88,7 +89,7 @@ class _ConfigContainerBase(_MCoreConfigContainerBase):
             return cls._convert_recipe_config_to_dict(value)
         if isinstance(value, PreTrainedConfig) and not hasattr(value, "to_cfg_dict"):
             return cls._convert_pretrained_config_to_dict(value, include_target=True)
-        return super()._convert_value_to_dict(value)
+        return _materialize_gtp_weight_shards(super()._convert_value_to_dict(value))
 
     @classmethod
     def _convert_recipe_config_to_dict(cls, value: RecipeConfig) -> dict[str, Any]:
@@ -135,8 +136,12 @@ class _ConfigContainerBase(_MCoreConfigContainerBase):
 
         if include_target and is_dataclass(value):
             field_names = {field.name for field in dataclass_fields(value) if not field.name.startswith("_")}
+            raw_values = vars(value)
             config_items = [
-                (field.name, getattr(value, field.name))
+                (
+                    field.name,
+                    raw_values[field.name] if field.name in raw_values else object.__getattribute__(value, field.name),
+                )
                 for field in dataclass_fields(value)
                 if not field.name.startswith("_")
             ]
@@ -199,18 +204,10 @@ def create_ddp_config(
 
 
 def apply_run_config_backward_compat(config_dict: dict[str, Any]) -> dict[str, Any]:
-    """Apply backward compatibility transformations to run config.
+    """Remove non-constructor dataclass state from legacy run configurations.
 
-    This function handles dataclass config fields that should not be passed to
-    the constructor when loading older checkpoints. It automatically detects
-    init=False fields by inspecting the target class.
-
-    The entire config is sanitized recursively to handle init=False fields in any part of the configuration hierarchy.
-
-    Args:
-        config_dict: The full run configuration dictionary.
-
-    Returns:
-        The config dictionary with backward compatibility fixes applied.
+    Keep Bridge's public compatibility entry point while using the sanitizer
+    supplied by the paired Megatron-Core. Checkpoint readers validate targets
+    before calling this function, since sanitizing resolves target classes.
     """
     return _sanitize_dataclass_config(config_dict)

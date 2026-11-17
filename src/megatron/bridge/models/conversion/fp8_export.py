@@ -101,13 +101,12 @@ def detect_fp8_export_layout(
 
     # Python and pybind TE dtype enums expose the same names; no TE import is needed.
     fp8_dtype = getattr(metadata.get("fp8_dtype"), "name", None)
-    if fp8_dtype is None:
-        # Without a declared float8 flavour the parameter is not an FP8 export candidate (a
-        # non-FP8 parameter, or metadata from a Transformer Engine build that does not stamp it).
-        # Reporting no layout keeps it out of the export instead of failing the whole run later
-        # in validate(), where the message would name a dtype the caller never set.
-        return None
     is_mxfp8 = fp8_recipe == "mxfp8" and "with_gemm_swizzled_scales" in metadata
+    if fp8_dtype is None and not is_mxfp8:
+        # An undeclared float8 flavour is not a general FP8 export candidate.
+        # Explicit MXFP8 metadata is different: it declares a quantized layout,
+        # so its validator must reject a missing/invalid dtype rather than skip it.
+        return None
     if is_mxfp8:
         return FP8ExportLayout(
             format_name="mxfp8",

@@ -27,6 +27,10 @@ import torch
 from megatron.core import tensor_parallel
 from megatron.core.config import set_experimental_flag
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig, finalize_model_grads
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallelV1,
+    FullyShardedDataParallelV2,
+)
 from megatron.core.jit import disable_jit_fuser
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
@@ -34,6 +38,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
+from megatron.core.utils import get_model_config
 from megatron.training.models.base import ModelConfig
 
 from megatron.bridge.data.loaders import build_train_valid_test_datasets_for_num_epochs, setup_data_iterators
@@ -41,7 +46,7 @@ from megatron.bridge.models.gpt.gpt_builder import GPTModelConfig
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.hybrid.hybrid_builder import HybridModelConfig
 from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
-from megatron.bridge.models.model_provider import ModelProviderMixin
+from megatron.bridge.models.model_provider import ModelProviderMixin, build_distributed_models
 from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.bridge.peft.utils import (
     enable_expert_parallel_grad_sync_in_finalize,
@@ -61,8 +66,8 @@ from megatron.bridge.training.config import ConfigContainer
 from megatron.bridge.training.gtp import (
     classify_gtp_remat_chains,
     configure_gtp_remat,
+    get_data_distribution_group,
 )
-from megatron.bridge.training.fsdp_compat import MEGATRON_FSDP_TYPES
 from megatron.bridge.training.initialize import initialize_megatron, set_jit_fusion_options
 from megatron.bridge.training.optim import (
     memory_efficient_fp32_optimizer_state_loading,
@@ -77,6 +82,7 @@ from megatron.bridge.training.tensor_inspect import (
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.checkpoint_utils import checkpoint_exists, is_hf_checkpoint_dir
 from megatron.bridge.training.utils.log_utils import append_to_progress_log, barrier_and_log, setup_logging
+from megatron.bridge.training.utils.optimizer_utils import uses_layer_wise_optimizer
 from megatron.bridge.training.utils.train_utils import start_memory_history_recording
 from megatron.bridge.utils.common_utils import get_rank_safe, print_rank_0
 
@@ -90,6 +96,7 @@ def _freeze_base_model_for_mtp(model: list[MegatronModule]) -> list[MegatronModu
             if hasattr(module, "expert_bias"):
                 module.frozen_expert_bias = "mtp.layers." not in name
     return model
+
 
 def _get_embedding_ranks(
     pp_ranks: list[int],
@@ -177,9 +184,7 @@ def _should_load_checkpoint(cfg: ConfigContainer, checkpoint_manager: Checkpoint
         "local_checkpoint_manager" in checkpointing_context
         and checkpointing_context["local_checkpoint_manager"].find_latest() != -1
     )
-    has_global_non_persistent_checkpoint = _has_global_non_persistent_checkpoint(
-        cfg.checkpoint.load, cfg.checkpoint
-    )
+    has_global_non_persistent_checkpoint = _has_global_non_persistent_checkpoint(cfg.checkpoint.load, cfg.checkpoint)
 
     if cfg.peft is not None:
         load_checkpoint_exists = cfg.checkpoint.load is not None and (
@@ -406,9 +411,7 @@ def setup(
                 checkpoint_path = cfg.checkpoint.pretrained_checkpoint
                 ckpt_step = None
             else:
-                raise RuntimeError(
-                    "No checkpoint source is available for ModelOpt state restoration"
-                )
+                raise RuntimeError("No checkpoint source is available for ModelOpt state restoration")
 
             if not has_modelopt_state(checkpoint_path, ckpt_step=ckpt_step):
                 raise RuntimeError(f"No modelopt_state found in selected checkpoint={checkpoint_path}")
@@ -460,12 +463,10 @@ def setup(
                     skip_load_to_model_and_opt=cfg.dist.use_torch_fsdp2,
                 )
             )
-        # Workaround for upstream mcore: reload_model_params() only refreshes the
-        # level-1 FP32 GPU shards of HybridDeviceOptimizer, so the level-2 CPU
-        # clones and level-3 FP32 working copies retain their random init.  Without
-        # this sync, the first optimizer step on (optimizer_cpu_offload=True + dist
-        # optimizer + BF16 + HF init) regresses the BF16 model to fresh random init.
-        # No-op when CPU offload is not enabled.  See NVIDIA-NeMo/RL PR #2372.
+        # Refresh HDO working masters after model-only initialization, or rebind
+        # saved FP32 masters/moments and restore CPU/GPU counters after full resume.
+        # Core's reload_model_params() and distributed state loader do not cover
+        # all of these working copies. No-op when CPU offload is not enabled.
         sync_hybrid_device_optimizer_fp32_master_copies(optimizer)
         timers("load-checkpoint").stop(barrier=True)
         timers.log(["load-checkpoint"])
@@ -482,7 +483,8 @@ def setup(
 
     _update_model_config_funcs(
         model,
-        cfg.model.transformer if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)) else cfg.model,
+        # Providers may copy their configuration while constructing the model.
+        get_model_config(model[0]),
         cfg.ddp,
         optimizer,
         align_grad_reduce=cfg.dist.align_grad_reduce,
@@ -519,7 +521,7 @@ def setup(
         train_state=state.train_state,
         model_length=len(model),
         train_valid_test_datasets_provider=train_valid_test_datasets_provider,
-        dp_group=pg_collection.dp,
+        dp_group=get_data_distribution_group(pg_collection, cfg.model),
         eval_dp_group=state._eval_pgs.dp if state._eval_pgs is not None else None,
     )
     timers("train/valid/test-data-iterators-setup").stop()
@@ -541,6 +543,7 @@ def setup(
             state.train_state.step,
             dataloader_load_path,
             pg_collection=pg_collection,
+            data_parallel_group=get_data_distribution_group(pg_collection, cfg.model),
         )
 
     # if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
@@ -592,7 +595,9 @@ def _register_setup_pre_wrap_hook(
             ]
         else:
             model_cfg._pre_wrap_hooks[:] = [
-                registered_hook for registered_hook in model_cfg._pre_wrap_hooks if registered_hook is not previous_hook
+                registered_hook
+                for registered_hook in model_cfg._pre_wrap_hooks
+                if registered_hook is not previous_hook
             ]
 
     setup_hooks[setup_hook_name] = hook
@@ -615,17 +620,22 @@ def _build_distributed_model(cfg: ConfigContainer, pg_collection: ProcessGroupCo
         nccl_ub=cfg.dist.gtp_remat_nccl_ub,
         pg_collection=pg_collection,
     )
-
+    if getattr(model_config, "freeze_base_model_for_mtp", False):
+        _register_setup_pre_wrap_hook(
+            model_config, _freeze_base_model_for_mtp, setup_hook_name="freeze_base_model_for_mtp"
+        )
     if isinstance(model_config, ModelConfig):
-        builder_cls = model_config.get_builder_cls()
-        builder = builder_cls(model_config)
-        model = builder.build_distributed_models(
-            pg_collection=pg_collection,
+        # PEFT loads base weights in a pre-wrap hook; the helper keeps FP32 router tensors through the cast.
+        model = build_distributed_models(
+            model_config,
+            pg_collection,
             ddp_config=cfg.ddp,
             overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            use_layer_wise_distributed_optimizer=uses_layer_wise_optimizer(cfg.optimizer),
             use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
             use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
             data_parallel_random_init=cfg.rng.data_parallel_random_init,
+            use_layer_wise_param_layout=getattr(cfg.optimizer, "use_layer_wise_param_layout", False),
         )
     else:
         model = model_config.provide_distributed_model(
@@ -633,10 +643,11 @@ def _build_distributed_model(cfg: ConfigContainer, pg_collection: ProcessGroupCo
             use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
             use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
             overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            use_layer_wise_distributed_optimizer=uses_layer_wise_optimizer(cfg.optimizer),
+            use_layer_wise_param_layout=getattr(cfg.optimizer, "use_layer_wise_param_layout", False),
             data_parallel_random_init=cfg.rng.data_parallel_random_init,
             pg_collection=pg_collection,
         )
-
     classify_gtp_remat_chains(model, model_config)
     return model
 
@@ -652,10 +663,18 @@ def _update_model_config_funcs(
     peft_enabled: bool = False,
 ) -> None:
     """Update model config sync funcs based on initialized model."""
-    if isinstance(model[0], (DistributedDataParallel, *MEGATRON_FSDP_TYPES)) and ddp_config.overlap_grad_reduce:
+    # DDP and MFSDP v1 only reduce during backward when overlap_grad_reduce is on, so
+    # without it there is nothing to suppress. MFSDP v2 always reduces in backward, so
+    # no_sync is how the schedule marks a non-final microbatch -- a correctness
+    # requirement, not an overlap optimization (mirrors Megatron-LM #7186). Without it,
+    # every backward finalizes the DP-outer axis and only the last microbatch's gradient
+    # reaches the optimizer.
+    if isinstance(model[0], FullyShardedDataParallelV2) or (
+        isinstance(model[0], (DistributedDataParallel, FullyShardedDataParallelV1)) and ddp_config.overlap_grad_reduce
+    ):
         assert model_config.no_sync_func is None, (
-            "When overlap_grad_reduce is True, config.no_sync_func must be None; "
-            "a custom no_sync_func is not supported when overlapping grad-reduce"
+            "config.no_sync_func must be None when the wrapper supplies its own no_sync "
+            "(overlap_grad_reduce, or Megatron-FSDP v2); a custom no_sync_func is not supported"
         )
         model_config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:

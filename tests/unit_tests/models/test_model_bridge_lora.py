@@ -12,16 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, PropertyMock
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from megatron.core import parallel_state
 
 import megatron.bridge.models.conversion.model_bridge as model_bridge_module
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import (
     AdapterWeightConversionTask,
+    HFSourcedWeightTuple,
+    HFWeightTuple,
     MegatronModelBridge,
     MegatronWeightTuple,
     WeightConversionTask,
@@ -29,6 +36,7 @@ from megatron.bridge.models.conversion.model_bridge import (
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ColumnParallelMapping,
+    MegatronParamMapping,
     ReplicatedMapping,
     RowParallelMapping,
     _fuse_gdn_separate_to_grouped,
@@ -36,6 +44,8 @@ from megatron.bridge.models.conversion.param_mapping import (
     merge_qkv_weights,
 )
 from megatron.bridge.models.conversion.peft_bridge import AdapterWeight
+from megatron.bridge.peft.lora_layers import LoRALinear
+from megatron.bridge.peft.lora_merge import LoRAMerge
 
 
 class DummyBridge(MegatronModelBridge):
@@ -72,6 +82,84 @@ def _patch_parallel_state(monkeypatch):
         "megatron.bridge.models.conversion.peft_bridge.parallel_state.get_tensor_model_parallel_group",
         lambda: None,
     )
+
+
+def _check_merge(rank, tp_group, layout, scale):
+    torch.manual_seed(123)
+    dim, width, rows = 4, 6, 8
+    base_full = torch.randn(rows, width, dtype=torch.float64)
+    a_full = torch.randn(dim, width, dtype=torch.float64)
+    b_full = torch.randn(rows, dim, dtype=torch.float64)
+    x = torch.randn(3, width, dtype=torch.float64)
+    upstream = torch.randn(3, rows, dtype=torch.float64)
+    a_ref, b_ref = a_full.clone().requires_grad_(), b_full.clone().requires_grad_()
+    expected = base_full + (2.0 if scale is None else scale) * (b_ref @ a_ref)
+    (torch.nn.functional.linear(x, expected) * upstream).sum().backward()
+
+    if layout == "column":
+        base = base_full.chunk(2, dim=0)[rank]
+        a = a_full.chunk(2, dim=0)[rank].clone().requires_grad_()
+        b = b_full.chunk(2, dim=0)[rank].clone().requires_grad_()
+        expected = expected.chunk(2, dim=0)[rank]
+        a_grad, b_grad = a_ref.grad.chunk(2, dim=0)[rank], b_ref.grad.chunk(2, dim=0)[rank]
+        upstream = upstream.chunk(2, dim=-1)[rank]
+    elif layout == "row":
+        base = base_full.chunk(2, dim=1)[rank]
+        a = a_full.chunk(2, dim=1)[rank].clone().requires_grad_()
+        b = b_full.chunk(2, dim=0)[rank].clone().requires_grad_()
+        expected = expected.chunk(2, dim=1)[rank]
+        a_grad, b_grad = a_ref.grad.chunk(2, dim=1)[rank], b_ref.grad.chunk(2, dim=0)[rank]
+        x = x.chunk(2, dim=-1)[rank]
+    else:
+        base = base_full
+        a, b = a_full.clone().requires_grad_(), b_full.clone().requires_grad_()
+        a_grad, b_grad = a_ref.grad, b_ref.grad
+
+    # Exercise the public effective-weight property as well as explicit export scaling.
+    if scale is None:
+        linear = torch.nn.Linear(base.shape[1], base.shape[0], bias=False, dtype=base.dtype)
+        linear.weight = torch.nn.Parameter(base.clone(), requires_grad=False)
+        adapter = torch.nn.Module()
+        adapter.linear_in = torch.nn.Linear(a.shape[1], a.shape[0], bias=False, dtype=a.dtype)
+        adapter.linear_out = torch.nn.Linear(b.shape[1], b.shape[0], bias=False, dtype=b.dtype)
+        adapter.linear_in.weight, adapter.linear_out.weight = torch.nn.Parameter(a), torch.nn.Parameter(b)
+        adapter.alpha, adapter.dim, adapter.tp_group = 8, dim, tp_group
+        wrapped = LoRALinear(linear, adapter)
+        a, b = adapter.linear_in.weight, adapter.linear_out.weight
+
+        def merge():
+            return wrapped.weight
+
+    else:
+
+        def merge():
+            return LoRAMerge().merge(base, b, a, 8, dim, tp_group=tp_group, scale=scale)
+
+    merged = merge()
+    torch.testing.assert_close(merged, expected, rtol=0, atol=0)
+    (torch.nn.functional.linear(x, merged) * upstream).sum().backward()
+    assert a.grad is not None
+    assert b.grad is not None
+    torch.testing.assert_close(a.grad, a_grad, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(b.grad, b_grad, rtol=1e-12, atol=1e-12)
+
+    with torch.no_grad():
+        exported = merge()
+    assert not exported.requires_grad
+    torch.testing.assert_close(exported, expected, rtol=0, atol=0)
+
+
+def _distributed_merge_worker(rank, rendezvous):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=60)
+    )
+    try:
+        for layout in ("column", "row", "replicated"):
+            for scale in (None, 0.375):
+                _check_merge(rank, dist.group.WORLD, layout, scale)
+    finally:
+        dist.destroy_process_group()
 
 
 def _patch_pipeline_state(
@@ -382,19 +470,30 @@ def test_merge_lora_adapter_weights_qkv_split(monkeypatch):
     torch.testing.assert_close(updated["v_proj.weight"], v_weight)
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("trailing_shape", [(), (4,)])
-def test_split_kda_qkv_linear_out_weight(trailing_shape):
+@pytest.mark.parametrize("value_head_dim", [2, 4])
+def test_split_kda_qkv_linear_out_weight(monkeypatch, tp_size, trailing_shape, value_head_dim):
     config = SimpleNamespace(
         kda_two_stage_gates=True,
-        linear_num_key_heads=2,
-        linear_num_value_heads=2,
+        linear_num_key_heads=8,
+        linear_num_value_heads=8,
         linear_key_head_dim=2,
-        linear_value_head_dim=2,
+        linear_value_head_dim=value_head_dim,
     )
-    sections = [torch.full((4, *trailing_shape), value) for value in (1.0, 2.0, 3.0)]
-    actual = DummyBridge()._split_qkv_linear_out_weight([SimpleNamespace(config=config)], torch.cat(sections))
+    sections = [
+        (torch.arange(rows, dtype=torch.float32) + offset)
+        .reshape(rows, *([1] * len(trailing_shape)))
+        .expand(rows, *trailing_shape)
+        .clone()
+        for rows, offset in ((16, 1), (16, 101), (8 * value_head_dim, 201))
+    ]
+    shards = [torch.cat([section.chunk(tp_size, dim=0)[rank] for section in sections]) for rank in range(tp_size)]
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", lambda: tp_size)
+    actual = DummyBridge()._split_qkv_linear_out_weight([SimpleNamespace(config=config)], torch.cat(shards))
     for name, expected in zip(("q_proj", "k_proj", "v_proj"), sections, strict=True):
-        torch.testing.assert_close(actual[name], expected)
+        torch.testing.assert_close(actual[name], expected, rtol=0, atol=0)
 
 
 def test_merge_lora_adapter_weights_grouped_expert_missing_expert_idx(monkeypatch):
@@ -602,6 +701,66 @@ def test_merge_canonical_adapter_from_weights(monkeypatch):
     torch.testing.assert_close(updated["decoder.layers.0.self_attn.q_proj.weight"], torch.ones(2, 2))
     torch.testing.assert_close(updated["decoder.layers.0.self_attn.k_proj.weight"], 2 * torch.ones(1, 2))
     torch.testing.assert_close(updated["decoder.layers.0.self_attn.v_proj.weight"], 3 * torch.ones(1, 2))
+
+
+def test_merge_partial_canonical_adapter_preserves_unselected_projection():
+    bridge = DummyBridge()
+    converted = {
+        "model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2),
+        "model.layers.0.self_attn.k_proj.weight": torch.zeros(1, 2),
+        "model.layers.0.self_attn.v_proj.weight": torch.full((1, 2), 9.0),
+    }
+    adapter_q = AdapterWeight(
+        global_base_prefix="decoder.layers.0.self_attention.linear_qkv",
+        adapter_key="adapter_q",
+        alpha=1,
+        dim=1,
+        linear_in_weight=MegatronWeightTuple("in_q", torch.tensor([[1.0, 2.0]]), vp_stage=0),
+        linear_out_weight=MegatronWeightTuple("out_q", torch.ones(2, 1), vp_stage=0),
+    )
+    adapter_k = AdapterWeight(
+        global_base_prefix="decoder.layers.0.self_attention.linear_qkv",
+        adapter_key="adapter_k",
+        alpha=1,
+        dim=1,
+        linear_in_weight=MegatronWeightTuple("in_k", torch.tensor([[1.0, 2.0]]), vp_stage=0),
+        linear_out_weight=MegatronWeightTuple("out_k", 2 * torch.ones(1, 1), vp_stage=0),
+    )
+
+    updated = bridge._merge_lora_adapter_weights(
+        [SimpleNamespace(config=SimpleNamespace(num_moe_experts=0))],
+        converted,
+        [adapter_q, adapter_k],
+    )
+
+    torch.testing.assert_close(updated["model.layers.0.self_attn.q_proj.weight"], torch.tensor([[1.0, 2.0]] * 2))
+    torch.testing.assert_close(updated["model.layers.0.self_attn.k_proj.weight"], torch.tensor([[2.0, 4.0]]))
+    torch.testing.assert_close(updated["model.layers.0.self_attn.v_proj.weight"], torch.full((1, 2), 9.0))
+
+
+def test_merge_single_canonical_adapter_preserves_unselected_projection():
+    bridge = DummyBridge()
+    converted = {
+        "model.layers.0.mlp.gate_proj.weight": torch.full((2, 2), 7.0),
+        "model.layers.0.mlp.up_proj.weight": torch.zeros(2, 2),
+    }
+    adapter_up = AdapterWeight(
+        global_base_prefix="decoder.layers.0.mlp.linear_fc1",
+        adapter_key="adapter_up",
+        alpha=1,
+        dim=1,
+        linear_in_weight=MegatronWeightTuple("in_up", torch.tensor([[1.0, 2.0]]), vp_stage=0),
+        linear_out_weight=MegatronWeightTuple("out_up", torch.ones(2, 1), vp_stage=0),
+    )
+
+    updated = bridge._merge_lora_adapter_weights(
+        [SimpleNamespace(config=SimpleNamespace(num_moe_experts=0))],
+        converted,
+        [adapter_up],
+    )
+
+    torch.testing.assert_close(updated["model.layers.0.mlp.gate_proj.weight"], torch.full((2, 2), 7.0))
+    torch.testing.assert_close(updated["model.layers.0.mlp.up_proj.weight"], torch.tensor([[1.0, 2.0]] * 2))
 
 
 def test_column_parallel_mapping_gathers_3d_expert_adapter_along_tp(monkeypatch):
@@ -1211,6 +1370,71 @@ def test_stream_adapter_weights_megatron_to_hf(monkeypatch):
     torch.testing.assert_close(weights[1].weight, 2 * torch.ones(2, 2))
 
 
+def test_stream_adapter_weights_megatron_to_hf_with_megatron_names(monkeypatch):
+    bridge = DummyBridge()
+    bridge.hf_pretrained = SimpleNamespace()
+    bridge.hf_config = bridge.hf_pretrained
+
+    adapter_task = AdapterWeightConversionTask(
+        global_base_prefix="decoder.layers.0.mlp.linear_fc1",
+        adapter_key=None,
+        alpha=2,
+        dim=4,
+        linear_in_task=WeightConversionTask(
+            param_name="local_in",
+            global_param_name="decoder.layers.0.mlp.linear_fc1.adapter.linear_in.weight",
+            mapping=Mock(),
+        ),
+        linear_out_task=WeightConversionTask(
+            param_name="local_out",
+            global_param_name="decoder.layers.0.mlp.linear_fc1.adapter.linear_out.weight",
+            mapping=Mock(),
+        ),
+    )
+    adapter_weight = AdapterWeight(
+        global_base_prefix="decoder.layers.0.mlp.linear_fc1",
+        adapter_key=None,
+        alpha=2,
+        dim=4,
+        linear_in_weight=MegatronWeightTuple(
+            "decoder.layers.0.mlp.linear_fc1.adapter.linear_in.weight", torch.ones(2, 2), vp_stage=0
+        ),
+        linear_out_weight=MegatronWeightTuple(
+            "decoder.layers.0.mlp.linear_fc1.adapter.linear_out.weight", 2 * torch.ones(2, 2), vp_stage=0
+        ),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "build_adapter_conversion_tasks",
+        lambda *_args, **_kwargs: {"decoder.layers.0.mlp.linear_fc1": [adapter_task]},
+    )
+    monkeypatch.setattr(bridge, "materialize_adapter_weights", lambda *_: [adapter_weight])
+    monkeypatch.setattr(
+        bridge,
+        "_get_base_hf_param_names_for_adapter",
+        lambda *_args, **_kwargs: ["model.layers.0.mlp.linear_fc1.weight"],
+    )
+    megatron_model = [SimpleNamespace(config=SimpleNamespace(num_moe_experts=0))]
+
+    plain = list(bridge.stream_adapter_weights_megatron_to_hf(megatron_model, cpu=False, show_progress=False))
+    assert [type(w) for w in plain] == [HFWeightTuple, HFWeightTuple]
+
+    sourced = list(
+        bridge.stream_adapter_weights_megatron_to_hf(
+            megatron_model, cpu=False, show_progress=False, with_megatron_names=True
+        )
+    )
+    assert [type(w) for w in sourced] == [HFSourcedWeightTuple, HFSourcedWeightTuple]
+    assert sourced[0].param_name.endswith("lora_A.weight")
+    assert sourced[0].megatron_param_names == ("decoder.layers.0.mlp.linear_fc1.adapter.linear_in.weight",)
+    assert sourced[0].megatron_param_name == "decoder.layers.0.mlp.linear_fc1.adapter.linear_in.weight"
+    assert sourced[1].param_name.endswith("lora_B.weight")
+    assert sourced[1].megatron_param_names == ("decoder.layers.0.mlp.linear_fc1.adapter.linear_out.weight",)
+    assert sourced[1].megatron_param_name == "decoder.layers.0.mlp.linear_fc1.adapter.linear_out.weight"
+    torch.testing.assert_close(sourced[0].weight, torch.ones(2, 2))
+    torch.testing.assert_close(sourced[1].weight, 2 * torch.ones(2, 2))
+
+
 def test_stream_adapter_weights_megatron_to_hf_qkv(monkeypatch):
     bridge = DummyBridge()
     bridge.hf_pretrained = SimpleNamespace()
@@ -1285,6 +1509,89 @@ def test_stream_adapter_weights_megatron_to_hf_qkv(monkeypatch):
     torch.testing.assert_close(weights[0].weight, torch.ones(2, 2))
     torch.testing.assert_close(weights[1].weight, qkv_slices["q_proj"])
     torch.testing.assert_close(weights[3].weight, qkv_slices["k_proj"])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("value_head_dim", [2, 4])
+def test_stream_kda_adapter_weights_preserves_tp_projection_order(monkeypatch, tp_size, dtype, value_head_dim):
+    from megatron.bridge.models.glm5next.glm53flash_bridge import _ColumnParallelConcatMapping
+
+    bridge = DummyBridge()
+    prefix = "decoder.layers.0.self_attention.in_proj"
+    hf_prefix = "model.layers.0.self_attn"
+    projection_names = ("q_proj", "k_proj", "v_proj")
+    config = SimpleNamespace(
+        num_moe_experts=0,
+        kda_two_stage_gates=True,
+        linear_num_key_heads=8,
+        linear_num_value_heads=8,
+        linear_key_head_dim=2,
+        linear_value_head_dim=value_head_dim,
+    )
+    linear_in = torch.eye(8, dtype=dtype)
+    sections = [
+        (torch.arange(rows * 8).reshape(rows, 8) + offset).to(dtype)
+        for rows, offset in ((16, 1), (16, 129), (8 * value_head_dim, 257))
+    ]
+    in_shards = list(linear_in.chunk(tp_size, dim=0))
+    out_shards = [torch.cat([section.chunk(tp_size, dim=0)[rank] for section in sections]) for rank in range(tp_size)]
+    adapter = SimpleNamespace(
+        linear_in=SimpleNamespace(weight=in_shards[0]),
+        linear_out=SimpleNamespace(weight=out_shards[0]),
+    )
+    registry = MegatronMappingRegistry(
+        _ColumnParallelConcatMapping(f"{prefix}.weight", [f"{hf_prefix}.{name}.weight" for name in projection_names])
+    )
+    monkeypatch.setattr(bridge, "mapping_registry", lambda: registry)
+    monkeypatch.setattr(
+        bridge,
+        "_megatron_global_adapters_info_all_pp_ranks",
+        lambda *_: [(f"{prefix}.adapter", prefix, False, True, False, 8, 8, 0, 0, False, False)],
+    )
+    monkeypatch.setattr(bridge, "_get_adapter_wrap_module", lambda *_: (adapter, None))
+    monkeypatch.setattr(parallel_state, "get_pipeline_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", lambda: tp_size)
+    monkeypatch.setattr(MegatronParamMapping, "tp_size", PropertyMock(return_value=tp_size))
+    monkeypatch.setattr(
+        MegatronParamMapping,
+        "gather_from_tp_ranks",
+        lambda mapping, _: in_shards if mapping.megatron_param.endswith("linear_in.weight") else out_shards,
+    )
+    models = [SimpleNamespace(config=config)]
+
+    # Keep task construction, ColumnParallelMapping, materialization and streaming real;
+    # mock only discovery and collectives, not the layout conversion under test.
+    tasks = bridge.build_adapter_conversion_tasks(models)[prefix]
+    assert isinstance(tasks[0].linear_out_task.mapping, ColumnParallelMapping)
+    materialized = bridge.materialize_adapter_weights(tasks)[0]
+    torch.testing.assert_close(materialized.linear_out_weight.weight, torch.cat(out_shards), rtol=0, atol=0)
+    exported = {
+        weight.param_name: weight.weight
+        for weight in bridge.stream_adapter_weights_megatron_to_hf(models, cpu=True, show_progress=False)
+    }
+
+    assert len(exported) == 6
+    for projection, expected in zip(projection_names, sections, strict=True):
+        actual_in = exported[f"{hf_prefix}.{projection}.lora_A.weight"]
+        actual_out = exported[f"{hf_prefix}.{projection}.lora_B.weight"]
+        torch.testing.assert_close(actual_in, linear_in, rtol=0, atol=0)
+        torch.testing.assert_close(actual_out, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            actual_out.float() @ actual_in.float(), expected.float() @ linear_in.float(), rtol=0, atol=0
+        )
+
+    merged = bridge._merge_lora_adapter_weights(
+        models,
+        {
+            f"{hf_prefix}.{name}.weight": torch.zeros_like(section)
+            for name, section in zip(projection_names, sections, strict=True)
+        },
+        [materialized],
+    )
+    for projection, expected in zip(projection_names, sections, strict=True):
+        torch.testing.assert_close(merged[f"{hf_prefix}.{projection}.weight"], expected, rtol=0, atol=0)
 
 
 def test_stream_adapter_weights_megatron_to_hf_fused_fc1(monkeypatch):
@@ -2723,17 +3030,13 @@ def test_split_gate_up_adapter_emits_one_task_per_half(monkeypatch):
     )
     monkeypatch.setattr(bridge, "mapping_registry", lambda: registry)
 
-    tasks = bridge.build_adapter_conversion_tasks([Mock()])[
-        "decoder.layers.0.mlp.linear_fc1"
-    ]
+    tasks = bridge.build_adapter_conversion_tasks([Mock()])["decoder.layers.0.mlp.linear_fc1"]
     assert len(tasks) == 2, "one task per pair (not per pair per entry)"
     by_half = {t.gate_up_half: t for t in tasks}
     assert sorted(by_half) == ["gate", "up"]
     # Each task must carry ITS pair's weights, not the other half's.
     assert by_half["up"].linear_in_task.param_weight is adapter.up.linear_in.weight
     assert by_half["gate"].linear_in_task.param_weight is adapter.linear_in.weight
-
-
 
 
 def test_dequantize_fp8_blockwise_matches_the_ragged_loop():
@@ -2762,7 +3065,7 @@ def test_dequantize_fp8_blockwise_matches_the_ragged_loop():
         return out.to(dtype)
 
     # Exact-block geometry (the checkpoint's): both dims multiples of 128.
-    for (M, N) in [(256, 128), (512, 256), (4096, 2048)]:
+    for M, N in [(256, 128), (512, 256), (4096, 2048)]:
         w = torch.randn(M, N).to(torch.float8_e4m3fn)
         s = torch.rand(M // 128, N // 128, dtype=torch.float32) * 0.5 + 0.1
         fast = dequantize_fp8_blockwise(w, s)
@@ -2807,6 +3110,7 @@ def test_shard_readahead_is_best_effort(tmp_path):
             state_mod._issue_shard_readahead(f)
         finally:
             os.posix_fadvise = orig
+
 
 def _cpu_mp_config(tp_size: int = 1):
     """Model-parallel config that keeps adapter construction off the GPU.
@@ -3130,7 +3434,8 @@ def test_split_qkv_adapter_emits_one_task_per_face(monkeypatch):
     assert by_face["v"].linear_in_task.global_param_name.endswith(".adapter.linear_in.weight.v")
 
 
-def test_stream_adapter_weights_megatron_to_hf_split_qkv_faces(monkeypatch):
+@pytest.mark.parametrize("with_megatron_names", [False, True])
+def test_stream_adapter_weights_megatron_to_hf_split_qkv_faces(monkeypatch, with_megatron_names):
     """Each face streams under its own HF name with its own tensor.
 
     The registry maps the fused ``linear_qkv`` base to all three q/k/v names at
@@ -3183,9 +3488,11 @@ def test_stream_adapter_weights_megatron_to_hf_split_qkv_faces(monkeypatch):
                 adapter_key=None,
                 alpha=2,
                 dim=4,
-                linear_in_weight=MegatronWeightTuple("local_in", torch.ones(2, 2), vp_stage=0),
+                linear_in_weight=MegatronWeightTuple(
+                    tasks[0].linear_in_task.global_param_name, torch.ones(2, 2), vp_stage=0
+                ),
                 linear_out_weight=MegatronWeightTuple(
-                    "local_out", face_tensors[tasks[0].qkv_face], vp_stage=0
+                    tasks[0].linear_out_task.global_param_name, face_tensors[tasks[0].qkv_face], vp_stage=0
                 ),
             )
         ],
@@ -3210,6 +3517,7 @@ def test_stream_adapter_weights_megatron_to_hf_split_qkv_faces(monkeypatch):
             [SimpleNamespace(config=SimpleNamespace(num_moe_experts=0))],
             cpu=False,
             show_progress=False,
+            with_megatron_names=with_megatron_names,
         )
     )
 
@@ -3228,6 +3536,14 @@ def test_stream_adapter_weights_megatron_to_hf_split_qkv_faces(monkeypatch):
     torch.testing.assert_close(weights[3].weight, face_tensors["k"])
     torch.testing.assert_close(weights[5].weight, face_tensors["v"])
 
+    if with_megatron_names:
+        for index, face in enumerate(("q", "k", "v")):
+            tag = "" if face == "q" else f".{face}"
+            assert weights[2 * index].megatron_param_names == (f"{base}.adapter.linear_in.weight{tag}",)
+            assert weights[2 * index + 1].megatron_param_names == (f"{base}.adapter.linear_out.weight{tag}",)
+    else:
+        assert all(len(weight) == 2 for weight in weights)
+
 
 def test_stream_adapter_weights_megatron_to_hf_split_qkv_rejects_missing_face(monkeypatch):
     """A registry that exposes no per-face HF base for the fused qkv must fail loudly."""
@@ -3245,9 +3561,7 @@ def test_stream_adapter_weights_megatron_to_hf_split_qkv_rejects_missing_face(mo
         linear_out_task=WeightConversionTask(param_name="local_out", global_param_name="g_out", mapping=Mock()),
         qkv_face="k",
     )
-    monkeypatch.setattr(
-        bridge, "build_adapter_conversion_tasks", lambda *_a, **_k: {base: [task]}
-    )
+    monkeypatch.setattr(bridge, "build_adapter_conversion_tasks", lambda *_a, **_k: {base: [task]})
     monkeypatch.setattr(
         bridge,
         "materialize_adapter_weights",
@@ -3545,9 +3859,7 @@ def test_gdn_in_proj_block_layout_reads_the_config_geometry():
     assert gdn_in_proj_block_layout(_gdn_config(), 96) == (32, 32, 0)
     assert gdn_in_proj_block_layout(_gdn_config(), 112) == (32, 32, 16)
     # The mixer's own shorter spellings are accepted too.
-    short = SimpleNamespace(
-        num_key_heads=4, key_head_dim=8, num_value_heads=4, value_head_dim=8
-    )
+    short = SimpleNamespace(num_key_heads=4, key_head_dim=8, num_value_heads=4, value_head_dim=8)
     assert gdn_in_proj_block_layout(short, 112) == (32, 32, 16)
     # Dual reading: the same geometry fits the per-rank width of a tp = 2 shard.
     assert gdn_in_proj_block_layout(_gdn_config(tensor_model_parallel_size=2), 56, tp_size=2) == (
@@ -3562,12 +3874,7 @@ def test_gdn_in_proj_block_layout_is_none_without_gdn_geometry():
     from megatron.bridge.peft.lora import gdn_in_proj_block_layout
 
     assert gdn_in_proj_block_layout(SimpleNamespace(), 112) is None
-    assert (
-        gdn_in_proj_block_layout(
-            SimpleNamespace(linear_num_key_heads=4, linear_key_head_dim=8), 112
-        )
-        is None
-    )
+    assert gdn_in_proj_block_layout(SimpleNamespace(linear_num_key_heads=4, linear_key_head_dim=8), 112) is None
 
 
 def test_gdn_in_proj_block_layout_rejects_a_width_below_the_qkv_blocks():
@@ -3578,9 +3885,7 @@ def test_gdn_in_proj_block_layout_rejects_a_width_below_the_qkv_blocks():
         gdn_in_proj_block_layout(_gdn_config(), 40)
 
 
-def _walk_with_gdn_config(
-    module_name: str, module, config, prefix: str, *, dim: int = 4, split: bool = True
-):
+def _walk_with_gdn_config(module_name: str, module, config, prefix: str, *, dim: int = 4, split: bool = True):
     """Run LoRA.transform on ``module`` with the TE-stub workarounds the CPU host needs.
 
     ``transformer_engine`` is stubbed on this host, so
@@ -3668,9 +3973,7 @@ def test_lora_walk_keeps_a_plain_adapter_for_out_proj():
         is_expert=False,
     )
 
-    wrapped = _walk_with_gdn_config(
-        "out_proj", module, config, "decoder.layers.0.inner_layer.self_attention"
-    )
+    wrapped = _walk_with_gdn_config("out_proj", module, config, "decoder.layers.0.inner_layer.self_attention")
 
     assert type(wrapped.adapter) is ParallelLinearAdapter
 
@@ -3692,9 +3995,7 @@ def _gdn_kda_registry():
     """The GLM-5.3-Flash KDA attention mappings, without the language_model prefix."""
     from megatron.bridge.models.glm5next.glm53flash_bridge import GLM53FlashBridge
 
-    return MegatronMappingRegistry(
-        *GLM53FlashBridge._kda_attn_mappings(_GDN_ATTN_LAYER, _GDN_HF_LAYER)
-    )
+    return MegatronMappingRegistry(*GLM53FlashBridge._kda_attn_mappings(_GDN_ATTN_LAYER, _GDN_HF_LAYER))
 
 
 def _fake_blocked_split_qkv_adapter():
@@ -3750,18 +4051,20 @@ def test_gdn_in_proj_registry_exposes_the_three_faces():
         assert [name for name in base_names if f".{face}_proj." in name] == [
             f"{_GDN_HF_LAYER}.self_attn.{face}_proj.weight"
         ]
-    assert bridge._resolve_hf_adapter_param_name(
-        registry, prefix, ".linear_in.weight", ".weight", None
-    ) == f"{_GDN_HF_LAYER}.self_attn.q_proj.lora_A.weight"
+    assert (
+        bridge._resolve_hf_adapter_param_name(registry, prefix, ".linear_in.weight", ".weight", None)
+        == f"{_GDN_HF_LAYER}.self_attn.q_proj.lora_A.weight"
+    )
 
     # out_proj is a plain single-name mapping.
     out_prefix = f"{_GDN_ATTN_LAYER}.inner_layer.self_attention.out_proj"
     assert bridge._get_base_hf_param_names_for_adapter(registry, out_prefix, None, ".weight") == [
         f"{_GDN_HF_LAYER}.self_attn.o_proj.weight"
     ]
-    assert bridge._resolve_hf_adapter_param_name(
-        registry, out_prefix, ".linear_out.weight", ".weight", None
-    ) == f"{_GDN_HF_LAYER}.self_attn.o_proj.lora_B.weight"
+    assert (
+        bridge._resolve_hf_adapter_param_name(registry, out_prefix, ".linear_out.weight", ".weight", None)
+        == f"{_GDN_HF_LAYER}.self_attn.o_proj.lora_B.weight"
+    )
 
 
 def test_split_qkv_adapter_blocked_emits_one_task_per_face_for_in_proj(monkeypatch):
@@ -3803,7 +4106,8 @@ def test_split_qkv_adapter_blocked_emits_one_task_per_face_for_in_proj(monkeypat
     assert by_face["v"].linear_out_task.mapping.hf_param == f"{_GDN_HF_LAYER}.self_attn.q_proj.lora_B.weight"
 
 
-def test_stream_adapter_weights_megatron_to_hf_gdn_in_proj_faces(monkeypatch):
+@pytest.mark.parametrize("with_megatron_names", [False, True])
+def test_stream_adapter_weights_megatron_to_hf_gdn_in_proj_faces(monkeypatch, with_megatron_names):
     """An ``in_proj`` split adapter streams under the three per-face HF names.
 
     Driven end-to-end through the REAL GLM-5.3-Flash KDA registry: the faces are
@@ -3840,8 +4144,12 @@ def test_stream_adapter_weights_megatron_to_hf_gdn_in_proj_faces(monkeypatch):
                 adapter_key=None,
                 alpha=2,
                 dim=4,
-                linear_in_weight=MegatronWeightTuple("local_in", torch.ones(2, 2), vp_stage=0),
-                linear_out_weight=MegatronWeightTuple("local_out", face_tensors[tasks[0].qkv_face], vp_stage=0),
+                linear_in_weight=MegatronWeightTuple(
+                    tasks[0].linear_in_task.global_param_name, torch.ones(2, 2), vp_stage=0
+                ),
+                linear_out_weight=MegatronWeightTuple(
+                    tasks[0].linear_out_task.global_param_name, face_tensors[tasks[0].qkv_face], vp_stage=0
+                ),
             )
         ],
     )
@@ -3856,6 +4164,7 @@ def test_stream_adapter_weights_megatron_to_hf_gdn_in_proj_faces(monkeypatch):
             [SimpleNamespace(config=SimpleNamespace(num_moe_experts=0))],
             cpu=False,
             show_progress=False,
+            with_megatron_names=with_megatron_names,
         )
     )
 
@@ -3871,6 +4180,14 @@ def test_stream_adapter_weights_megatron_to_hf_gdn_in_proj_faces(monkeypatch):
     torch.testing.assert_close(weights[3].weight, face_tensors["k"])
     torch.testing.assert_close(weights[5].weight, face_tensors["v"])
 
+    if with_megatron_names:
+        for index, face in enumerate(("q", "k", "v")):
+            tag = "" if face == "q" else f".{face}"
+            assert weights[2 * index].megatron_param_names == (f"{base}.adapter.linear_in.weight{tag}",)
+            assert weights[2 * index + 1].megatron_param_names == (f"{base}.adapter.linear_out.weight{tag}",)
+    else:
+        assert all(len(weight) == 2 for weight in weights)
+
 
 def test_stream_adapter_weights_megatron_to_hf_gdn_out_proj_is_one_plain_task(monkeypatch):
     """``out_proj`` is a single pair and streams under HF ``o_proj``."""
@@ -3880,9 +4197,7 @@ def test_stream_adapter_weights_megatron_to_hf_gdn_out_proj_is_one_plain_task(mo
 
     base = f"{_GDN_ATTN_LAYER}.inner_layer.self_attention.out_proj"
     adapter = _build_plain_adapter()
-    monkeypatch.setattr(
-        bridge, "_megatron_global_adapters_info_all_pp_ranks", lambda *_: plain_adapters_info(base)
-    )
+    monkeypatch.setattr(bridge, "_megatron_global_adapters_info_all_pp_ranks", lambda *_: plain_adapters_info(base))
     monkeypatch.setattr(bridge, "_get_adapter_wrap_module", lambda *_: (adapter, None))
     monkeypatch.setattr(
         "megatron.bridge.models.conversion.model_bridge.parallel_state.get_pipeline_model_parallel_rank",
@@ -3897,7 +4212,6 @@ def test_stream_adapter_weights_megatron_to_hf_gdn_out_proj_is_one_plain_task(mo
     assert tasks[0].qkv_face is None
     assert tasks[0].linear_in_task.mapping.hf_param == f"{_GDN_HF_LAYER}.self_attn.o_proj.lora_A.weight"
     assert tasks[0].linear_out_task.mapping.hf_param == f"{_GDN_HF_LAYER}.self_attn.o_proj.lora_B.weight"
-
 
 
 def test_adapter_wrapper_delegates_output_layer_flags():
@@ -3944,87 +4258,33 @@ def test_adapter_wrapper_delegates_output_layer_flags():
     wrapper.sequence_parallel = True
     assert base.sequence_parallel is True
 
-    # A wrapped module without the flags still raises AttributeError rather
-    # than silently answering something (same class of error as before the
-    # properties existed).
+    # The TP output flag remains a live read-through rather than a wrapper cache.
+    base.gather_output = True
+    assert wrapper.gather_output is True
+
+    # A plain nn.Linear has no TP gathering step: its full-width output is already
+    # replicated. dev's default True describes that layout correctly and keeps
+    # native output observation hooks usable for the non-parallel linear path.
     plain = nn.Linear(4, 4)
     plain_wrapper = LoRALinear(plain, _FakeAdapter())
-    try:
-        plain_wrapper.gather_output
-    except AttributeError:
-        pass
-    else:
-        raise AssertionError("a wrapped module without gather_output must not silently answer")
+    assert not hasattr(plain, "gather_output")
+    assert plain_wrapper.gather_output is True
+    x = torch.randn(3, 4)
+    actual = plain_wrapper(x)
+    assert actual.shape == (3, 4)
+    torch.testing.assert_close(actual, plain(x) + x)
+    # No sequence-parallel mode is invented for modules that do not declare it.
+    with pytest.raises(AttributeError):
+        _ = plain_wrapper.sequence_parallel
 
 
-def test_dequantize_fp8_blockwise_matches_the_ragged_loop():
-    """The vectorized exact-block path must agree bit-for-bit with the
-    reference loop (the ragged path is the same code the fast path replaced).
-    Guards the GLM-5.3-Flash import: 37,338 tensors ride this function, and a
-    silent numeric drift here would move every weight in the model."""
-    import torch
-
-    from megatron.bridge.models.conversion.quantization_utils import (
-        dequantize_fp8_blockwise,
-    )
-
-    torch.manual_seed(0)
-
-    def ragged_reference(weight, scale_inv, block_size=128, dtype=torch.bfloat16):
-        M, N = weight.shape
-        w = weight.float()
-        out = torch.empty_like(w)
-        sM, sN = scale_inv.shape
-        for bi in range(sM):
-            for bj in range(sN):
-                r0, r1 = bi * block_size, min((bi + 1) * block_size, M)
-                c0, c1 = bj * block_size, min((bj + 1) * block_size, N)
-                out[r0:r1, c0:c1] = w[r0:r1, c0:c1] * scale_inv[bi, bj]
-        return out.to(dtype)
-
-    # Exact-block geometry (the checkpoint's): both dims multiples of 128.
-    for (M, N) in [(256, 128), (512, 256), (4096, 2048)]:
-        w = torch.randn(M, N).to(torch.float8_e4m3fn)
-        s = torch.rand(M // 128, N // 128, dtype=torch.float32) * 0.5 + 0.1
-        fast = dequantize_fp8_blockwise(w, s)
-        ref = ragged_reference(w, s)
-        assert fast.shape == ref.shape
-        assert torch.equal(fast, ref), f"fast path diverged at {(M, N)}"
-
-    # Ragged geometry must still work (loop path).
-    w = torch.randn(300, 200).to(torch.float8_e4m3fn)
-    s = torch.rand(3, 2, dtype=torch.float32) * 0.5 + 0.1
-    out = dequantize_fp8_blockwise(w, s)
-    assert out.shape == (300, 200)
-    assert torch.equal(out, ragged_reference(w, s))
+@pytest.mark.unit
+def test_tp_merge_forward_and_backward(tmp_path: Path):
+    """Real TP2 collectives must sum all ranks' contributions to the gathered adapter."""
+    mp.spawn(_distributed_merge_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2, join=True)
 
 
-def test_shard_readahead_is_best_effort(tmp_path):
-    """The readahead helper must never break a load: a missing file, a
-    directory, or a platform without posix_fadvise all fall through silently.
-    The win it buys on the real mount is 4.5-7.6x on cold shards (measured),
-    and the load must not trade that for a new failure mode."""
-    from megatron.bridge.models.hf_pretrained import state as state_mod
-
-    # A real file: call must succeed and leave the file readable.
-    f = tmp_path / "shard.safetensors"
-    f.write_bytes(b"\0" * 4096)
-    state_mod._issue_shard_readahead(f)
-    assert f.read_bytes() == b"\0" * 4096
-
-    # Missing path and a directory: silent no-ops, no exception.
-    state_mod._issue_shard_readahead(tmp_path / "nope.safetensors")
-    state_mod._issue_shard_readahead(tmp_path)
-
-    # Platform without fadvise: monkeypatch it away and confirm the helper
-    # still swallows the AttributeError.
-    import os
-
-    had = hasattr(os, "posix_fadvise")
-    if had:
-        orig = os.posix_fadvise
-        del os.posix_fadvise
-        try:
-            state_mod._issue_shard_readahead(f)
-        finally:
-            os.posix_fadvise = orig
+@pytest.mark.unit
+@pytest.mark.parametrize("scale", [None, 0.375])
+def test_single_rank_merge_forward_and_backward(scale):
+    _check_merge(0, None, "replicated", scale)
